@@ -1,3 +1,6 @@
+## 0.5.4（2026-09-07）
+- submit-ok / submit-failed / permission-pending 事件载荷补 remoteSessionId（binding 的远程会话 id），供编排层透出尾号排查 binding 失配归属。
+
 - 修复（独立复跑发现）：① prompt 传输中断（ACP connection closed/ECONNRESET 等）不再逃逸看门狗循环——按 kill→reconnect→无限重试处理（仅 isClosed/abort/SUBMIT_TIMEOUT 终止）；② reconnect 失败路径加 250ms 防空转延迟；③ connect() 增加 options.spawn 测试缝，watchdog 单测纯 mock 不依赖真实 CLI。watchdog 测试 8/8，全量 95/95。
 # Changelog
 

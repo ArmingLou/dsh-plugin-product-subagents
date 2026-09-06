@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.8] — 2026-09-06
+
+### Added
+- **ACP 权限交互授权（requestPermission 三层策略）**：不再一律拒绝（旧版 unattended 行为是 deveco/opencode 越权读文件→空正文失败的根因之一）。
+  - `permission: 'interactive'`（默认）：ACP 产品请求权限（读文件/执行命令等）时经宿主 `ctx.approval` 向用户弹窗——允许一次 / 总是允许 / 拒绝一次 / 总是拒绝；`allowed-once` 映射 ACP 协议 `selected + allow_once optionId`。
+  - `permission: 'read'`：只读类请求自动放行（`allow_once`），其余交互。
+  - `permission: 'all'`：全部自动放行（危险，仅信任产品时使用）。
+  - `permission: 'deny'`：一律拒绝（旧 fail-closed 行为）。
+  - 无审批通道 / 无 open turn / 审批异常 → fail-closed 拒绝（绝不放行）。
+- **ACP 协议合规修复**：权限响应此前返回 `{outcome:'rejected'}`——ACP 协议只认 `cancelled` 或 `selected + optionId`，非法值会令严格实现的产品（deveco 等）行为异常；现按协议返回 `selected(reject_once/reject_always)` 或 `cancelled`。
+- 权限请求处理器（`decidePermission`）导出为纯函数，新增 `test/permission.test.js` 14 项单测（autoGrant 全放行/只读/写拒绝、handler 同步/异步/optionId 直返/垃圾值 fail-closed/异常 fail-closed、sessionId 透传等）。
+
+### Config
+- provider 配置新增 `permission` 字段（interactive/read/all/deny），cordis.patch.yml 中按产品设置。
+
+All notable changes to this project are documented in this file.
+
 ## [0.3.7] — 2026-09-06
 
 ### Added

@@ -13,3 +13,4 @@ registry*.json
 # editor
 .vscode/
 .idea/
+*.tgz

@@ -1,6 +1,33 @@
+- 修复（独立复跑发现）：① prompt 传输中断（ACP connection closed/ECONNRESET 等）不再逃逸看门狗循环——按 kill→reconnect→无限重试处理（仅 isClosed/abort/SUBMIT_TIMEOUT 终止）；② reconnect 失败路径加 250ms 防空转延迟；③ connect() 增加 options.spawn 测试缝，watchdog 单测纯 mock 不依赖真实 CLI。watchdog 测试 8/8，全量 95/95。
 # Changelog
 
 All notable changes to this project are documented in this file.
+
+## [0.5.3] — 2026-09-07
+
+### Added
+- **child-closed 事件订阅**（A）：订阅 `product-subagents/child-closed` 事件 → 取消空闲定时器 + 立即 dispose 远程会话（bridge.dispose → closeSession + SIGTERM），agent-dispatch closeChild 不再依赖 idleTimeoutMs 被动回收。
+- **中断语义**（B）：ACP bridge submit 监听 `exec.signal` abort → closeSession + SIGKILL 终止 in-flight prompt，保留 binding 允许后续 reconnect 冷恢复；抛出 `SUBMIT_ABORTED` 错误，submit-failed 事件附带 `interrupted: true` 标记。
+- **reconnect 守卫**（C）：新增 `closedChildren` Set——已被 child-closed 标记的 childId 不允许恢复重连，抛出 `RECONNECT_BLOCKED` 错误，不再拉起进程。
+- **自动冻结恢复看门狗**（F）：
+  - in-flight prompt 连续无输出 ≥ `watchdogNoOutputMs`（默认 180000ms=3 分钟，可通过 provider config 配置）→ kill ACP 进程 → reconnect → 继续等待 prompt。
+  - **无限重试**：冻结条件持续则 kill→reconnect 无限循环，唯一终止条件为 child 被 agent_close（`WATCHDOG_CLOSED`）或 interrupt（`SUBMIT_ABORTED`）或 prompt 自然返回。
+  - **per-round 状态机**：每轮 submit 重新武装看门狗，prompt 返回/close/interrupt 解除；后续 submit 不受此前 interrupt 影响。
+  - **与 C 守卫共用状态源**：`isClosed` 回调检查 `closedChildren` + `signal.aborted`，看门狗 kill→reconnect 循环复用同一判定。
+  - 合法长生成区分：`lastActivityAt`（onActivity 实际输出）重置冻结窗口，慢网络/慢模型只要有输出继续等待。
+  - `idleTimeoutMs`（默认 10 分钟）作为看门狗之上的兜底上限——超过此时间仍无输出则 `SUBMIT_TIMEOUT`。
+  - kill 计数仅日志用途（"累计 N 次 kill 恢复"），不限制重试。
+- **watchdogNoOutputMs 配置**：provider 定义新增 `watchdogNoOutputMs` 字段（如 `deveco: { type: acp, command: opencode, args: [acp], watchdogNoOutputMs: 120000 }`），透传至 acp bridge。
+
+### Changed
+- `deps` 传递 `closedChildren` 至 product-submit 工具。
+- scheduleDispose 路径保留为兜底（事件不可达时仍按 idleTimeoutMs 回收）。
+- acp bridge `submit` 签名新增 `isClosed` 回调参数（第六参数，默认 `() => false`）。
+- 旧 `promptOnce` 替换为 `promptWithWatchdog`（含看门狗 kill→reconnect 循环）；旧 `reconnect-once` + `SUBMIT_TIMEOUT` 抛错路径整合进看门狗状态机。
+- `product-submit.js` 传递 `isClosed` 回调至 bridge.submit。
+
+### Tests
+- `test/watchdog.test.js`（7 项）：看门狗配置、isClosed 守卫集成、冻结检测与 kill、守卫耗尽不再重连、活跃输出无误触发、配置覆盖默认值。
 
 ## [0.5.2] — 2026-09-06
 

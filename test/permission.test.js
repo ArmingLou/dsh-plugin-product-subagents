@@ -95,6 +95,34 @@ test('handler 收到 sessionId 与描述（编排层反查/弹窗用）', () => 
   assert.equal(seen.options.length, 4)
 })
 
+test('v0.4.2：描述含 arguments 的 path（弹窗不再只显示"工具调用"）', () => {
+  let seen = null
+  decidePermission({
+    product: 'deveco',
+    permissionHandler: (payload) => { seen = payload; return 'allow' },
+  }, {
+    sessionId: 'ses-x',
+    options: opts(),
+    toolCall: { name: 'read_file', arguments: { path: '/Users/arming/.dsh/AGENTS.md' } },
+  })
+  assert.ok(seen.description.includes('read_file'), seen.description)
+  assert.ok(seen.description.includes('/Users/arming/.dsh/AGENTS.md'), seen.description)
+  assert.ok(seen.paths.includes('/Users/arming/.dsh/AGENTS.md'))
+})
+
+test('v0.4.2：arguments 为 JSON 字符串时也能解析出路径', () => {
+  let seen = null
+  decidePermission({
+    product: 'opencode',
+    permissionHandler: (payload) => { seen = payload; return 'allow' },
+  }, {
+    options: opts(),
+    toolCall: { name: 'file_read', arguments: '{"file": "/Users/arming/Downloads/x.srt"}' },
+  })
+  assert.ok(seen.description.includes('file=/Users/arming/Downloads/x.srt'), seen.description)
+  assert.ok(seen.paths.includes('/Users/arming/Downloads/x.srt'))
+})
+
 test('无 allow_once 只有 allow_always 时放行选 allow_always', () => {
   const r = decidePermission({ autoGrant: 'all' }, {
     options: [{ kind: 'allow_always', optionId: 'always' }, { kind: 'reject_once', optionId: 'r1' }],
@@ -112,4 +140,50 @@ test('allow-always 但服务端无 allow_always 选项 → 退回 allow_once', (
     options: [{ kind: 'allow_once', optionId: 'once' }, { kind: 'reject_once', optionId: 'r1' }],
   })
   assert.deepEqual(r, { outcome: { outcome: 'selected', optionId: 'once' } })
+})
+
+test('v0.4.3：opencode 系真实载荷（title=external_directory + locations）→ 显示类别与路径', () => {
+  let seen = null
+  decidePermission({
+    product: 'deveco',
+    permissionHandler: (payload) => { seen = payload; return 'allow' },
+  }, {
+    sessionId: 'ses-x',
+    options: opts(),
+    toolCall: {
+      kind: 'other',
+      locations: [{ path: '/Users/arming/.dsh/AGENTS.md' }, { path: '/Users/arming/.dsh' }],
+      rawInput: { filepath: '/Users/arming/.dsh/AGENTS.md', parentDir: '/Users/arming/.dsh' },
+      status: 'pending',
+      title: 'external_directory',
+      toolCallId: 'chatcmpl-tool-x',
+    },
+  })
+  assert.ok(seen.description.includes('访问外部目录'), seen.description)
+  assert.ok(seen.description.includes('/Users/arming/.dsh/AGENTS.md'), seen.description)
+  assert.ok(seen.description.includes('/Users/arming/.dsh'), seen.description)
+})
+
+test('v0.4.3：title=edit → 写入/修改文件', () => {
+  let seen = null
+  decidePermission({
+    product: 'deveco',
+    permissionHandler: (payload) => { seen = payload; return 'allow' },
+  }, {
+    options: opts(),
+    toolCall: { title: 'edit', locations: [{ path: '/tmp/a.txt' }] },
+  })
+  assert.ok(seen.description.includes('写入/修改文件'), seen.description)
+})
+
+test('v0.4.3：title=bash → 执行命令', () => {
+  let seen = null
+  decidePermission({
+    product: 'deveco',
+    permissionHandler: (payload) => { seen = payload; return 'allow' },
+  }, {
+    options: opts(),
+    toolCall: { title: 'bash', locations: [{ path: '/bin/ls' }] },
+  })
+  assert.ok(seen.description.includes('执行命令'), seen.description)
 })

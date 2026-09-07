@@ -235,7 +235,7 @@ describe('watchdog permission-pending exemption', () => {
     let pending = true
     const bridge = createAcpBridge({
       watchdogNoOutputMs: 80,
-      isPermissionPending: () => pending,
+      isHumanWaitPending: () => pending,
       spawn: failSpawn,
     })
     let killSig = false

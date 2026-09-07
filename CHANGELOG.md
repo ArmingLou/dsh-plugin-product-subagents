@@ -1,3 +1,6 @@
+## 0.5.6（2026-09-07）
+- 重构：isPermissionPending 泛化为 isHumanWaitPending——豁免判定覆盖任何人类决策等待（授权 pendingDecisions + 预留问答 pendingQuestions 注册表，后者当前无写入方、结构就位）；acp.js 兼容旧键名。设计约束（记档）：ACP 会话任何等待人类决策的期间，看门狗不触发 kill/超时、10 分钟空闲回收自动推迟——问答功能落地时只需把问答挂起注册进 pendingQuestions 即自动获得豁免。
+
 ## 0.5.5（2026-09-07）
 - 权限等待豁免：ACP 权限请求正等待人类决策期间（pendingDecisions 命中），看门狗不触发无输出冻结/空闲超时（虚拟心跳），10 分钟空闲回收自动推迟——静默等待决策是正常状态而非冻结；决策落定后冻结窗口从该刻重算。新增 isPermissionPending 回调（index.js→providers→acp.js）与 scheduleDispose 推迟逻辑，附单测。
 

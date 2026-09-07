@@ -229,3 +229,35 @@ describe('watchdog configuration override', () => {
     assert.equal(typeof bridgeDefault.submit, 'function')
   })
 })
+
+describe('watchdog permission-pending exemption', () => {
+  it('does NOT trigger freeze while permission is pending (human waiting)', async () => {
+    let pending = true
+    const bridge = createAcpBridge({
+      watchdogNoOutputMs: 80,
+      isPermissionPending: () => pending,
+      spawn: failSpawn,
+    })
+    let killSig = false
+    const remote = {
+      sessionId: 'perm-pending-test',
+      proc: { exitCode: null, signalCode: null, kill(sig) { killSig = true; this.exitCode = 137 } },
+      connection: {
+        async prompt() { await new Promise(() => {}) },
+        closeSession() { return Promise.resolve() },
+      },
+      progressRef: () => ({ lastActivityAt: 0 }),
+      drainText: () => '', stderrTail: () => '', drainStderr: () => '',
+    }
+    // 前 500ms 权限挂起（豁免期）；随后解除挂起但无输出 → 冻结应触发
+    setTimeout(() => { pending = false }, 500)
+    const ac = new AbortController()
+    const timeout = setTimeout(() => ac.abort(), 3000)
+    let code = null
+    try { await bridge.submit(remote, 'task', ac.signal, '/tmp', {}, () => false) } catch (e) { code = e.code }
+    clearTimeout(timeout)
+    // 挂起期间不应 kill；解除后冻结会 kill→reconnect(假 spawn 失败)→循环→abort 终止
+    assert.ok(code === 'SUBMIT_ABORTED' || code === 'WATCHDOG_CLOSED', `got ${code}`)
+    assert.ok(killSig, 'freeze after pending released should have killed')
+  })
+})

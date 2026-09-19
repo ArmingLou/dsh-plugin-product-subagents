@@ -12,6 +12,7 @@
 - **两层权限模型** — 中继模型永远是只读传话筒;`permissionMode`(`readonly` / `default` / `full`)作用于远程产品,映射到各产品自己的 CLI 标志。
 - **权限天花板** — 子代理不能派生出比自己权限更高的后代。
 - **任意 ACP Agent** — 通过 `config.providers` 加 Cursor(`agent acp`)、CodeBuddy(`cbc --acp`)、Gemini(`gemini --acp`)等,零代码。
+- **动态模型 / effort 目录** — 采集每个 ACP 会话的 `configOptions`,在 `set_config_option` 与 `config_option_update` 后保持最新,按子代理以事件透出,并按 provider 落盘缓存;产品不提供该取值时回退到其默认档位,而不是让回合失败(见[模型与 effort 动态发现](#模型与-effort-动态发现))。
 - **资源管理** — 空闲释放、可配超时、并发上限。
 - **跨平台** — Windows `.cmd` 垫片、Windows 安全路径转义;CI 覆盖 macOS / Ubuntu / Windows。
 
@@ -108,7 +109,74 @@ config:
   maxConcurrentChildren: 8    # 同时存在的连续式子代理上限
   rolesDir: <path>            # 声明式角色库目录(默认 roles/)
   registryPath: <path>        # 持久化远程会话注册表
+  providerCatalogTtlMs: 86400000   # 条目超过此时长即视为过期并重探(默认 24h,仅作用于启动预探)
+  providerProbeOnStart: true  # 启动时只探测已过期的 provider(缓存新鲜时零进程开销)
+  providerProbeTimeoutMs: 30000    # 单个 provider 探测硬上限(含 CLI 冷启动);超时则 SIGKILL 该子进程、
+                                   # 写 error 条目,且不进行第二次重试
 ```
+
+目录路径本身**不可配置**:`provider-catalog.json` 是跨插件契约,消费方按固定路径
+`$DSH_HOME/data/dsh-plugin-product-subagents/provider-catalog.json` 读取。
+
+## 模型与 effort 动态发现
+
+ACP v1 没有 `availableModels` / `session/set_model`:会话可用的模型与推理档位,唯一可移植来源是
+`configOptions`(由 `session/new|load|resume` 响应、每次 `session/set_config_option` 响应、
+每次 `config_option_update` 通知各带一份完整快照)。配置项的 **id 由产品自定**,本仓库解析规则是
+「id 精确匹配优先 → `category` 兜底」,绝不硬编码。取值通过 `session/set_config_option` 应用,
+并把响应里的完整快照回写(effort 取值域依赖所选 model,丢弃响应就是联动陈旧的根因)。
+
+**配错值不会弄坏回合。** 手写 `agents.json` 里的 model/effort 若产品不认,一律**回退到产品自己的默认档位**:
+空串或 `default` 视为「不指定」(不发调用)、值不在产品自报的 `options[].value` 取值域内(不发调用)、
+产品没有该 option(不发调用)、发出去被产品拒绝(捕获不抛)。四种情形会话都保持当前值,
+`product_submit` 照常完成。每次回退都发
+`product-subagents/config-option-error` `{…, kind, requested, optionId, effective, available[],
+reason, error, configOptions, at}`,`reason ∈ no-option | not-in-values | rejected`,
+`effective` 即本次真正生效的值。`console.warn` 按 `(kind,value)` 去重,事件则每回合都发,
+方便 dispatch 日志回答「填了 X 为什么没生效」。
+
+外部消费方有两个数据面:
+
+- **事件** — `product-subagents/config-options`
+  `{childId, product, remoteSessionId, configOptions, at}`(子代理绑定、每次
+  `config_option_update`、以及冷恢复后各透出一次);回退(缺项/域外/被拒)时发
+  `product-subagents/config-option-error`(字段见上);每次缓存写完后发
+  `product-subagents/provider-catalog-updated` `{providers: [name], at}`;
+  请求事件 `product-subagents/probe-provider` payload `{provider?, cwd?, reason}`
+  (缺省 `provider` = 探测全部已注册 ACP provider;失败同样发 updated)。
+- **`provider-catalog.json`** — provider 级缓存,也是跨插件的数据面(事件不会自动转发到 GUI)。形状冻结:
+
+```json
+{ "version": 1, "updatedAt": "<ISO>",
+  "providers": { "deveco": {
+    "models": ["deveco/GLM-5.1", "deveco/GLM-5.3"],
+    "modelOptions": [
+      { "value": "deveco/GLM-5.1", "name": "DevEco Code/GLM-5.1" } ],
+    "efforts": ["low", "high", "max", "default"],
+    "effortOptions": [ { "value": "low", "name": "Low" } ],
+    "modelEfforts": { "…": ["…"] },
+    "modelEffortOptions": { "…": [{ "value": "…", "name": "…" }] },
+    "source": "probe", "probedAt": "<ISO>", "error": "<仅探测失败时>" } } }
+```
+
+**`value` 与 `name` 的分工就是契约**:`value` 是落盘并喂给 `session/set_config_option` 的那个 id
+(如 `deveco/GLM-5.1`,**原样保留、不改写不丢弃**),`name` 是产品自报的显示名(GUI 下拉用,
+如 `DevEco Code/GLM-5.1`),`description` 可选、缺失即省略键。分组形态
+(`SessionConfigSelectGroup[]`)展开收集;`models` / `efforts` 仍是纯 value 字符串数组,
+`*Options` 是**增量字段**,不替换旧字段。
+
+缓存对用户配置**只读**:探测绝不写 `agents.json`、不"纠正"已存的 model;空清单的含义是
+"这次没探到"(配 `error`),不是"该产品没有这些值"。
+
+`modelEfforts` 只在产品自身按模型 id 分组 effort 时才填,拿不到关联就省略该键而不是猜。
+探测失败写入 `models: []` + `error`,不抛异常、不影响其他 provider。
+
+两条语义:
+
+- `efforts` 是**探测时那个 model 下的**取值域(产品若按模型分组,取 `models[current]` 那一组,
+  而不是跨模型并集);联动后的权威快照走 child 级 `config-options` 事件。
+- TTL 只约束**启动预探**。`probe-provider` 事件一律真探覆盖 —— GUI 的「刷新」按钮不能被
+  一条新鲜的缓存条目挡掉,新鲜但**失败**的条目同样重探。
 
 ## 角色与权限
 

@@ -4,6 +4,7 @@ node_modules/
 # harness / runtime state
 *.log
 .DS_Store
+.qoder/
 
 # session / credential artifacts — never commit
 *.jsonl

@@ -1,3 +1,91 @@
+## [0.6.1] — 2026-09-19
+
+### Fixed
+- **安装态与源码不一致（本地打包链路的 pnpm 缓存陷阱）**：`pnpm add file:.../dsh-plugin-product-subagents-0.6.0.tgz`
+  在**同名同版本**下会按 `pnpm-lock.yaml` 里记录的 `integrity` 命中 store 缓存，于是"重新打包 + 重装"
+  看起来成功、`node_modules` 里却仍是旧内容（实测：安装态 `lib/bridges/acp.js` sha256 与源码不一致，
+  而 tgz 内容本身是正确的）。
+  本版本**代码与 0.6.0 完全相同**，仅提升版本号以改变 specifier（新文件名 → 必然重新解析），
+  使安装态与源码逐字节一致。发版建议：本地 `file:` 依赖重装后，务必用逐文件 sha256 复核，不要只看
+  pnpm 的输出。（未采用 `--force`：它依赖具体 pnpm 版本的缓存行为，不如换 specifier 确定。）
+
+## [0.6.0] — 2026-09-18
+
+### Added
+- **ACP 可用模型 / effort 动态取得并透出**：ACP v1 没有 `availableModels`/`session/set_model`，
+  唯一的可移植来源是会话的 `configOptions`。现在 bridge 会采集、回写并向外透出这份快照。
+  - `config_option_update` 通知被采集（原先只处理 `agent_message_chunk`，快照会在会话生命周期内失真）。
+  - 新增事件 `product-subagents/config-options`
+    （payload `{childId, product, remoteSessionId, configOptions, at}`），在子代理首次绑定、
+    每次 `config_option_update`、以及 `product_submit` 冷恢复后透出。
+  - **选项元数据透出（显示名 / 落盘值分离）**：`provider-catalog.json` 的每个 provider 条目增量
+  补 `modelOptions` / `effortOptions`（`[{value, name?, description?}]`）与可选的
+  `modelEffortOptions`。`value` 是能喂给 `session/set_config_option` 的落盘 id（原样保留，
+  不改写不丢弃），`name` 是产品自报的显示名（GUI 下拉不再有理由亮裸 id）；
+  `description` 缺失即省略键。分组形态 `SessionConfigSelectGroup[]` 展开收集。
+  `models` / `efforts` 纯 value 数组**保留不删**（消费方既有读取路径），新字段是增量。
+  新导出 `configOptionEntries()`（`configOptionValues` 现在由它派生）。
+  缓存对用户配置只读：探测不写 `agents.json`、不"纠正"已存值，空清单只代表"这次没探到"。
+  实测回报（真机、逐条对得上 `set_config_option` 生效）：
+  `deveco/GLM-5.1` = value、`DevEco Code/GLM-5.1` = name（回灌 `set model=deveco/GLM-5.1` →
+  `currentValue=deveco/GLM-5.1`）；qoder `qmodel_38max`/`Qwen3.8-Max (default)`、
+  `reasoning_effort` `xhigh`/`Extra High`…；opencode `effort` `low|high|max|default`
+  → `Low|High|Max|Default`（152 个 model 全部带 name）。
+- 新增事件 `product-subagents/config-option-error`：配置项应用失败时可被上层观测（不再只有 console.warn）。
+- **provider 目录探测与缓存**：新增 `lib/provider-catalog.js`，用一条「建完就弃」的 ACP 会话
+  拿到某 provider 的取值域，落盘 `~/.dsh/data/dsh-plugin-product-subagents/provider-catalog.json`
+  （`{version:1, updatedAt, providers:{<name>:{models,modelOptions,efforts,effortOptions,modelEfforts?,modelEffortOptions?,source,probedAt,error}}}`），
+  原子写 tmp+rename、损坏自愈、TTL 默认 24h。该文件是跨插件的数据面（事件不会自动转发到 GUI）。
+  - 新增通知事件 `product-subagents/provider-catalog-updated`（`{providers:[name], at}`，每次缓存写完后发）。
+  - 新增请求事件 `product-subagents/probe-provider`（payload `{provider?, cwd?, reason}`；
+    `provider` 缺省 = 探测全部已注册 ACP provider；失败同样发 updated）。
+  - 新增配置：`providerCatalogTtlMs`、`providerProbeOnStart`（默认 true，仅在缓存过期时拉起进程，
+    **只约束启动预探**——`probe-provider` 事件一律真探覆盖，否则 GUI「刷新」按钮会被新鲜条目挡掉）、
+    `providerProbeTimeoutMs`（默认 30000，单次探测硬上限，超时写 `error` 且不二次重试）。
+  - 目录路径**不开放配置**（故意不提供 `providerCatalogDir`）：`provider-catalog.json` 是跨插件契约，
+    消费方按固定路径 `$DSH_HOME/data/dsh-plugin-product-subagents/provider-catalog.json` 读取，
+    可配置只会让两仓路径分叉；配了该键会显式 warn 一次而不是静默失效。
+  - `efforts` 语义收紧：产品按模型分组时取「当前 model 那一组」，不再给跨模型并集。
+
+### Fixed
+- **探测超时/失败会泄漏子进程**：`withTimeout(bridge.create())` 只 reject，`finally` 仅在
+  `remote` 非空时 dispose，而 `bridge.create` 内部早已 spawn → 僵死 CLI 留在系统里还占着 stdio。
+  现在 a) ACP 桥新增 `options.onSpawn(proc)` 观察者（`providers.js` 转发），prober 拿到句柄，
+  超时即 SIGKILL；b) `create()` 落定得比放弃晚时补一次 `dispose`；c) acp.js 自身每个
+  「已 spawn 但拿不到 remote」的出口（握手失败、`session/new` 被拒、reconnect 双失败）
+  统一走 `killOrphan`。三条路径各有断言用例。
+- **effort 硬编码 `configId:'effort'`**：改为「id 精确匹配优先（`effort`/`reasoning_effort`/`thought_level`）
+  → `category:'thought_level'` 兜底」。实测 qoder 的 effort 是 `id=reasoning_effort` 且 `category=model`，
+  仅靠 category 兜底会把模型档位当成 effort 写回去；model 同理（`id=model` → `category=model`，并排除对方 id）。
+- **`setSessionConfigOption` 返回值被丢弃 → model→effort 联动陈旧**（唯一根因）。现在响应里的完整
+  `configOptions` 一律回写共享快照后再应用 effort；实测 opencode 切 model 后 thought_level 值域
+  由 `low|high|max|default` 变为 `low|medium|high|xhigh|max|default`。
+- **配置项应用失败不再静默**：每个 `(kind,value)` 只告警一次，消息带上 agent 真实上报的
+  `id(category=…, current=…, values=…)` 取值域，并附 `onConfigError` 回调。
+- **手填错 model / effort 不再影响使用（回退到产品默认）**：`applySettings` 从「尽力而为、失败只 warn」
+  升级为显式回退链——①空串或 `default` 视为「不指定」，不发调用；②值不在该 option 的 `options[].value`
+  取值域内 → **不发** `session/set_config_option`（省一次必然失败的往返）；③产品没有该 option（如
+  deveco 无 reasoning 档位）→ 不发；④发出去被产品拒绝 → 捕获，**不抛、不中断 `product_submit` 回合**。
+  四种情形会话都沿用当前值（= 产品自己的默认档位），任务照常完成。新导出 `domainAccepts()`
+  （空域一律放行：没有依据就判非法会把本来能用的配置挡死；分组形态按全组并集判定，避免误挡
+  「换 model 后才合法」的档位）。
+  `product-subagents/config-option-error` payload 增补 `{optionId, effective, available[], reason}`，
+  `reason ∈ 'no-option' | 'not-in-values' | 'rejected'`；`effective` 优先取 set 响应回写后的
+  `currentValue`，否则取会话现值。console.warn 仍按 `(kind,value)` 去重，但事件**每回合都发**，
+  便于 dispatch 日志逐回合回答「填了 X 为什么没生效」。
+
+### Tests
+- `test/watchdog.test.js` 扩展：configOption 动态解析（纯函数，含 `domainAccepts` 预校验）+ 手搓
+  ndjson JSON-RPC 假 agent 走线
+  （create 捕获快照、真实 configId 回写、联动刷新、通知采集、告警去重），以及回退链三情形
+  ——域外值（不发调用、`effective`=会话现值）、域内值被产品拒绝（捕获不抛、回合照常完成）、
+  产品无对应 option（降级、不瞎猜 configId），另加「空串/`default` 不发调用也不报错」。共 26 项。
+- `test/provider-catalog.test.js`（21 项）：载荷解析（扁平/分组/畸形）、显示名与 description 取舍
+  （`value`↔`name` 分离、无名省略键、`models` 与 `modelOptions` 1:1 对齐）、冻结文件形状、
+  TTL/失败语义、探测编排（串行、dispose、失败不影响他者、并发去重、`staleNames`、刷新绕过 TTL）、
+  进程清理（超时 SIGKILL、迟到会话补 dispose、`session/new` 被拒收孤儿）。全部注入临时目录与假
+  bridge/假 spawn，不依赖真实 CLI 或 API key。
+
 ## 0.5.6（2026-09-07）
 - 重构：isPermissionPending 泛化为 isHumanWaitPending——豁免判定覆盖任何人类决策等待（授权 pendingDecisions + 预留问答 pendingQuestions 注册表，后者当前无写入方、结构就位）；acp.js 兼容旧键名。设计约束（记档）：ACP 会话任何等待人类决策的期间，看门狗不触发 kill/超时、10 分钟空闲回收自动推迟——问答功能落地时只需把问答挂起注册进 pendingQuestions 即自动获得豁免。
 

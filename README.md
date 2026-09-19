@@ -25,6 +25,11 @@ permission ceiling, and cross-platform process launching.
   permission than it has.
 - **Any ACP agent** — add Cursor (`agent acp`), CodeBuddy (`cbc --acp`),
   Gemini (`gemini --acp`) and more via `config.providers`; no code needed.
+- **Dynamic model / effort catalog** — each ACP session's `configOptions` is
+  captured, kept fresh across `set_config_option` and `config_option_update`,
+  published per child as an event, and cached per provider on disk. A value the
+  product doesn't advertise falls back to its own default instead of failing the
+  turn (see [Model & effort discovery](#model--effort-discovery)).
 - **Resource management** — idle disposal, configurable timeouts, concurrency
   cap.
 - **Cross-platform** — Windows `.cmd` shims, Windows-safe path escaping;
@@ -126,7 +131,93 @@ config:
   maxConcurrentChildren: 8    # cap on simultaneous continuable children
   rolesDir: <path>            # declarative role library (default: roles/)
   registryPath: <path>        # durable remote-session registry
+  providerCatalogTtlMs: 86400000   # re-probe a provider once its entry is older than this
+  providerProbeOnStart: true  # probe only stale providers at startup (0 cost when fresh)
+  providerProbeTimeoutMs: 30000    # hard cap per provider probe, incl. CLI cold start;
+                                   # on timeout the child process is SIGKILLed, the entry
+                                   # records `error` and no second attempt is made
 ```
+
+The catalog path itself is **not configurable**: `provider-catalog.json` is a
+cross-plugin contract and consumers read the fixed
+`$DSH_HOME/data/dsh-plugin-product-subagents/provider-catalog.json`.
+
+## Model & effort discovery
+
+ACP v1 has no `availableModels` / `session/set_model`: the only portable source
+for a session's models and reasoning levels is its `configOptions` (carried by
+the `session/new|load|resume` response, every `session/set_config_option`
+response, and every `config_option_update` notification). The option **ids are
+product-defined** — this plugin resolves them as *exact id first, `category` as
+fallback*, and never hard-codes one. A value is applied through
+`session/set_config_option`, whose response is written back to the cached
+snapshot (effort levels depend on the selected model; dropping that response
+is what makes the pair go stale).
+
+**A wrong value never breaks a turn.** A hand-edited `agents.json` model or
+effort the product can't honour falls back to the agent's own default: empty or
+`default` means "unspecified" (no call), a value outside the advertised
+`options[].value` domain is not sent at all, a missing option is skipped, and a
+rejection from the product is caught — the session keeps its current value and
+`product_submit` completes normally either way. Every such attempt publishes
+`product-subagents/config-option-error` `{…, kind, requested, optionId,
+effective, available[], reason, error, configOptions, at}` where `reason` is
+`no-option | not-in-values | rejected` and `effective` is the value that
+actually applies. `console.warn` dedupes per `(kind, value)`; the event fires
+on every turn so dispatch logs can answer "why didn't X take effect".
+
+Consumers get two surfaces:
+
+- **Events** — `product-subagents/config-options`
+  `{childId, product, remoteSessionId, configOptions, at}` per child (emitted on
+  bind, on every `config_option_update`, and after a cold resume);
+  `product-subagents/config-option-error` for the fallback cases above;
+  `product-subagents/provider-catalog-updated`
+  `{providers: [name], at}` after each cache write; and the request event
+  `product-subagents/probe-provider` `{provider?, cwd?, reason}` (omit
+  `provider` to probe every registered ACP provider — failures still publish
+  `provider-catalog-updated`).
+- **`provider-catalog.json`** — provider-level cache and the cross-plugin data
+  plane (events are not forwarded to the GUI). Shape is frozen:
+
+```json
+{ "version": 1, "updatedAt": "<ISO>",
+  "providers": { "deveco": {
+    "models": ["deveco/GLM-5.1", "deveco/GLM-5.3"],
+    "modelOptions": [
+      { "value": "deveco/GLM-5.1", "name": "DevEco Code/GLM-5.1" } ],
+    "efforts": ["low", "high", "max", "default"],
+    "effortOptions": [ { "value": "low", "name": "Low" } ],
+    "modelEfforts": { "…": ["…"] },
+    "modelEffortOptions": { "…": [{ "value": "…", "name": "…" }] },
+    "source": "probe", "probedAt": "<ISO>", "error": "<only when the probe failed>" } } }
+```
+
+**`value` vs `name` is the contract**: `value` is what gets persisted and fed to
+`session/set_config_option` (e.g. `deveco/GLM-5.1` — verbatim, never rewritten),
+`name` is the product's own display label for the GUI (`DevEco Code/GLM-5.1`),
+`description` is optional and omitted when absent. Grouped
+`SessionConfigSelectGroup[]` options are flattened, and `models` / `efforts`
+stay plain string arrays for existing readers — the `*Options` fields are
+additive.
+
+The catalog is **read-only with respect to user configuration**: probing never
+writes `agents.json` or "corrects" a stored model, and an empty list means "this
+probe failed" (`error` is set), never "this product has no models".
+
+`modelEfforts` appears only when the product itself groups effort values by
+model id; it is omitted rather than guessed. Failed probes store `models: []`
+plus `error` instead of throwing.
+
+Semantics worth knowing:
+
+- `efforts` is the value domain **under the model that was current at probe
+  time** (when the product groups efforts by model, the group of
+  `models[current]` is used — never the cross-model union). The authoritative
+  linked snapshot is the per-child `config-options` event.
+- The TTL gates the **startup pre-probe only**. `probe-provider` always
+  re-probes — a GUI "refresh" button must not be swallowed by a fresh cache
+  entry, including a fresh *failed* one.
 
 ## Roles and permissions
 

@@ -1,3 +1,73 @@
+## [0.7.2] — 2026-09-29
+
+### Changed
+- **`subagent_progress` 不再为 `hasChildren` 多读一次目录**：0.7.1 曾按宿主
+  `listDescendants` 的规则补回该字段，但复核旧实现发现——它只是被拷进
+  `listStatus` 后**从未输出**（`product_agents` 同样从不输出），是彻头彻尾的死数据。
+  改为与旧行为一致（输出 `activity` / `mode` / `label`），省掉每次查询的一次
+  `listChildren` 调用。
+- 新增 `test/tool-output.test.js`：用桩上下文驱动 4 个工具的**真实 execute**，
+  断言返回值「能原样 JSON 往返」（宿主无损 JSON 规则的本地等价），并顺带钉住
+  `activity` 推导与「只读一次父目录」的行为。这是 0.7.1 那类缺陷的回归闸门——
+  `npm test` 即可拦住，不依赖宿主重启。
+
+## [0.7.1] — 2026-09-29
+
+### Fixed
+- **工具返回值含 `undefined` 属性 → 整个工具报错（旧缺陷，升级后实测暴露）**：宿主用
+  `isJsonValue` / `snapshotJsonValue` 校验工具返回值必须「无损 JSON」——`undefined`
+  值的自有属性会在 JSON 往返中被丢弃，因此被判非法，整次调用失败：
+  `tool "<name>" returned invalid output: value is not lossless JSON`（`ToolOutputError`）。
+  实测 `0.1.0-rc.6` 与 `0.2.0-rc.1` **两版同样严格**（不是升级回归），只要有一个可选字段为空就中招：
+  `product_agents` 的子代理没有 binding 时 `product: undefined`、`product_wait` 在
+  ready/timeout 时 `stopReason: undefined`、`subagent_progress` 的 `mode/label/lastTask/…` 等。
+  新增 `lib/json-safe.js` 的 `jsonSafe()`：递归丢弃 `undefined` 属性值（数组项里的 `undefined`
+  转 `null`，避免下标位移），6 个工具的出参全部经它收口，后续再加可选字段不会再弄坏调用。
+  新增 `test/json-safe.test.js`（含「输出必须能原样 JSON 往返」这条宿主规则的本地编码），
+  并把该规则的**两半**（宿主拒绝 undefined / 接受 `jsonSafe` 输出）加进 `npm run check:host`。
+
+## [0.7.0] — 2026-09-29
+
+### Breaking
+- **适配 dsh 0.2.0-rc.1(宿主接口换代)**。旧声明 `@deepseek-ai/dsh-subagent` /
+  `@deepseek-ai/dsh-tools` `^0.1.0-rc.6` 会让宿主在加载期直接拒绝本插件
+  (peerDependencies 与**运行时版本**做 semver 判定,`dsh-app-boot`),现改为
+  `~0.2.0-rc.1`、`@deepseek-ai/cordis` 对齐到 `^4.0.4`。**本版本不再支持 dsh 0.1.x**
+  (需要旧宿主请留在 0.6.x)。
+
+### Fixed
+- **会话连续性恢复链路(冷恢复)在 0.2 上静默失效**：0.2 移除了 `Session.events`
+  取值器(改为 `Session.snapshotEvents(fromSeq, toSeqExclusive)`)。`recoverRemoteSessionId`
+  与 `foldProgress` / `foldTrace` / `foldTokenUsage` 原先直接读 `session.events`，
+  在新宿主上会读到 `undefined` → 目标子会话「找不到 PRODUCT_SESSION 标记」→
+  空闲回收/重启后无法重连远程产品会话(且进度、轨迹、token 统计全部为空，无异常)。
+  新增 `lib/host-compat.js` 的 `sessionEvents()`：优先 `snapshotEvents()`，
+  回退旧的 `events` 取值器——0.1.x 与 0.2.x 共用一条代码路径。
+- **`product_wait` 在 0.2 上恒超时**：0.2 的 `ctx.subagents.listChildren()` 返回
+  `SubagentCatalogEntry`(`{ id, createdAt, mode, label }`)，**不再带 `activity`**。
+  旧代码 `me ? me.activity : 'unknown'` 取到 `undefined` → 既不是 `'unknown'` 也不是
+  `'inactive'` → 已结算的子代理也被当作 live 分支一直阻塞到 timeout。
+  现按宿主 `listDescendants` 的同款规则从会话存储推导驻留性
+  (`sessions.get(id) === undefined ? 'inactive' : 'running'`，见 `childActivity()`)。
+- **`product_agents` / `subagent_progress` 的 `activity` 静默变空**：
+  同样源于 `listChildren` 条目字段裁撤，现按会话驻留性推导。
+  （`subagent_progress` 里的 `hasChildren` 是旧实现拷进 `listStatus` 后从未输出的**死数据**，
+  一并去掉——顺带省掉每次查询多读一次该 child 目录的开销；`product_agents` 从不输出该字段。）
+
+### Added
+- **`SubagentCapabilities.agentOptions: false`**：0.2 的能力位新增成员且为必填。填 `false`
+  是诚实声明——外部产品 CLI 无法兑现宿主的 provider/model/reasoningEffort 覆盖(产品模型与
+  档位由 role 与产品自身的 configOptions 决定)。这样一次性(one-shot)带 `agentOptions` 的
+  委派会**显式失败**(`UNSUPPORTED_CAPABILITY`)而不是被静默忽略;continuable 路径由
+  continuation manager 自行组装，不看该标志位。
+- **`npm run check:host`(`scripts/check-host-compat.mjs`)**：对**真实安装的** dsh 运行时
+  校验宿主契约——直接调用宿主自己的兼容性判定函数(`dsh-app-boot` 的
+  `evaluatePluginCompatibility`，也就是当初拒绝加载的那一个)、核对 subagent / session
+  接口面，并把插件的 6 个工具定义拿**运行时那份 `defineTool`** 跑一遍(源码复制到临时树、
+  `@deepseek-ai/dsh-tools` 指向运行时副本)。以后每次 DSH 升级先跑它，能提前发现同类断裂。
+- `test/host-compat.test.js`：覆盖 `snapshotEvents()` 新路径、旧 `events` 回退、异常/非数组
+  读取器，以及「0.2 会话依然能恢复 PRODUCT_SESSION 标记」的回归用例。
+
 ## [0.6.1] — 2026-09-19
 
 ### Fixed

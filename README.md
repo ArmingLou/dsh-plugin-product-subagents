@@ -37,10 +37,15 @@ permission ceiling, and cross-platform process launching.
 
 ## Requirements
 
-- A DeepSeek Harness deployment (web profile).
+- A DeepSeek Harness deployment (web profile) running **dsh `0.2.0-rc.1`**
+  (the `0.2` line). This release targets the 0.2 subagent/tools seams; on
+  dsh `0.1.x` use plugin `0.6.x`.
 - At least one product CLI on `PATH` and authenticated: `claude`, `codex`, or
   an ACP CLI (`opencode`, `agent`, `cbc`, …).
 - Node ≥ 18.
+
+Verify an installation against the running harness with `npm run check:host`
+(see [Host compatibility](#host-compatibility)).
 
 ## Install
 
@@ -258,6 +263,35 @@ providers:
 Providers appear in the delegation enum only when their command is detected
 on `PATH`. Built-ins (`claude-code`, `codex`, `acp`) can be overridden with
 the same keys.
+
+## Host compatibility
+
+This plugin tracks a DSH generation: **dsh `0.2.x`** (peer
+`@deepseek-ai/dsh-subagent` / `@deepseek-ai/dsh-tools` `~0.2.0-rc.1`). DSH
+refuses to load a plugin whose `@deepseek-ai/dsh*` peer ranges do not satisfy
+the *running* version, so a harness upgrade disables an un-updated plugin —
+pair them as follows:
+
+| dsh runtime | plugin |
+| --- | --- |
+| `0.2.x` | `0.7.x` (this release) |
+| `0.1.x` | `0.6.x` |
+
+After upgrading dsh, verify an installation against the running harness:
+
+```bash
+npm run check:host
+# or point it at a specific install:
+DSH_RUNTIME_ROOT=/path/to/node_modules/@deepseek-ai/dsh npm run check:host
+```
+
+It runs the host's **own** compatibility predicate against this `package.json`,
+checks the `ctx.subagents` and session seams this plugin uses, and registers
+all six plugin tools through the runtime's `defineTool`. Two seams it guards
+specifically: `Session.snapshotEvents()` (the log reader behind cold-resume
+recovery) and `ctx.subagents.listChildren()` entries (dsh 0.2 dropped their
+`activity` / `hasChildren` fields; `lib/host-compat.js` derives them locally
+with the host's own residency rule).
 
 ## Development
 

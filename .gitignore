@@ -15,3 +15,6 @@ registry*.json
 .vscode/
 .idea/
 *.tgz
+
+# scratch tree of `npm run check:host`
+.host-check/

@@ -18,9 +18,12 @@
 
 ## 环境要求
 
-- DeepSeek Harness 部署(web profile)。
+- DeepSeek Harness 部署(web profile),dsh 版本为 **`0.2.0-rc.1`**(即 0.2 线)。
+  本版本适配 0.2 的 subagent / tools 接口;dsh `0.1.x` 请用插件 `0.6.x`。
 - 至少一个产品 CLI 在 `PATH` 且已登录:`claude`、`codex`,或某个 ACP CLI(`opencode`、`agent`、`cbc`…)。
 - Node ≥ 18。
+
+可用 `npm run check:host` 对着运行中的 harness 复核安装态(见[宿主兼容性](#宿主兼容性))。
 
 ## 安装
 
@@ -210,6 +213,32 @@ providers:
 ```
 
 只有命令在 `PATH` 上被检测到,Provider 才会出现在委派枚举里。内置三件套(`claude-code` / `codex` / `acp`)可用同名键覆盖。
+
+## 宿主兼容性
+
+本插件跟随 DSH 的某个世代:**dsh `0.2.x`**(peer 依赖
+`@deepseek-ai/dsh-subagent` / `@deepseek-ai/dsh-tools` 为 `~0.2.0-rc.1`)。
+宿主会用**运行中的版本**校验插件的 `@deepseek-ai/dsh*` peer 范围,不满足就直接拒绝加载,
+所以 harness 升级会停用未跟进的插件——对应关系如下:
+
+| dsh 运行版本 | 插件版本 |
+| --- | --- |
+| `0.2.x` | `0.7.x`(本版本) |
+| `0.1.x` | `0.6.x` |
+
+DSH 升级后,对着运行中的 harness 复核安装态:
+
+```bash
+npm run check:host
+# 或指定某个安装位置:
+DSH_RUNTIME_ROOT=/path/to/node_modules/@deepseek-ai/dsh npm run check:host
+```
+
+它会用宿主**自己的**兼容性判定函数校验本 `package.json`,核对插件用到的
+`ctx.subagents` 与会话接口面,并把 6 个插件工具经**运行时那份** `defineTool` 注册一遍。
+其中两个接口面被重点守护:`Session.snapshotEvents()`(冷恢复链路背后的日志读取口)
+与 `ctx.subagents.listChildren()` 条目(dsh 0.2 裁掉了条目的 `activity` /
+`hasChildren`,现由 `lib/host-compat.js` 按宿主自身的驻留规则在本地推导)。
 
 ## 开发
 

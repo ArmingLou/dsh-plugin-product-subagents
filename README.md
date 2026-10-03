@@ -141,7 +141,70 @@ config:
   providerProbeTimeoutMs: 30000    # hard cap per provider probe, incl. CLI cold start;
                                    # on timeout the child process is SIGKILLed, the entry
                                    # records `error` and no second attempt is made
+  # v0.7.3 submit-failure grading. Default (see lib/submit-failure.js):
+  #   failover    → the orchestrator may silently switch to the next route
+  #   fatal       → no route switch; reported as the final failure
+  #   interrupted → a human cancel; neither a product fault nor retried
+  # Anything unlisted falls back to `failover`, so only an explicitly `fatal`
+  # error stops a route switch.
+  submitFailureGrades:
+    EMPTY_RESPONSE: failover      # the product answered with no text
+    RATE_LIMITED: failover        # 429 / rate limit / quota / insufficient balance
+    SUBMIT_TIMEOUT: failover
+    INVALID_API_KEY: fatal        # auth: retrying cannot help
+    INVALID_ARGUMENT: fatal       # bad request/params: retrying cannot help
+    SYNTAX_ERROR: fatal
+    MODEL_NOT_FOUND: fatal
+    RECONNECT_BLOCKED: fatal
+  # v0.7.4 failover hand-off mode. All three modes use a SIBLING replacement
+  # (a direct child of the main agent); they differ only in who decides, and when:
+  #   notify-then-auto (default) → publish a waking notice + expose agent_failover,
+  #                              wait notifyWaitMs; on timeout the orchestrator
+  #                              dispatches the sibling replacement itself
+  #   notify                   → only wait for the main agent; on timeout the
+  #                              submission FAILS (no automatic route switch)
+  #   auto                     → no waiting, no notice; switch immediately
+  failoverMode: notify-then-auto
+  notifyWaitMs: 90000            # how long to wait for the main agent's decision
 ```
+
+### Submit-failure grading and in-turn failover
+
+`product_submit` classifies every submission failure before rethrowing it, and
+publishes the grade on the `product-subagents/submit-failed` event payload
+(`grade`). It also exposes `onFailover(handler)` on that payload: a listener may
+register a handler **synchronously during the emit**, and `product_submit` then
+**blocks on that handler instead of throwing**. That is what keeps a fallback
+chain from leaking an intermediate failure to the parent agent — the failing
+child's turn is still open, so the host has not settled it yet.
+
+| handler returns | `product_submit` does |
+|---|---|
+| `{ handedOff: true, nextProvider, newChildId }` | throws `FAILOVER_HANDED_OFF`: this child is done — the orchestrator terminated it and dispatched the **next route as a sibling child of the main agent**. It emits **no** second `submit-failed` (that unknown code would grade as `failover`, re-register `onFailover` and start a second chain — i.e. two subagents on one task) and no `submit-ok` |
+| `{ timedOut: true, summary, message }` | throws `FAILOVER_EXHAUSTED` carrying a self-explaining message: which routes were tried, each one's last error, **and why no switch happened** |
+| `{ text }` | **legacy** (orchestrator <= 0.7.3): returns `text` as the answer of *this* submission and emits `submit-ok` with `viaFailover: true` |
+| `{ exhausted: true, message }` | **legacy**: throws `FAILOVER_EXHAUSTED` carrying the self-explaining `message` |
+| throws | logs and falls back to the original submission error — a broken orchestrator is never reported as an exhausted route chain |
+| nothing registered | throws the original error, byte-identical to v0.3.7 behaviour |
+
+Handlers are only consulted for `failover`-graded failures; `fatal` and
+`interrupted` always throw straight through.
+
+Two invariants worth stating explicitly:
+
+- **The wait is bounded and is not raced against `exec.signal`.** The orchestrator
+  owns the authoritative `notifyWaitMs` timer; this plugin additionally arms a
+  `notifyWaitMs + 2s` safety net (cleared in a `finally`, so it never holds the host
+  process open) purely so a *broken* orchestrator cannot leave `product_submit`
+  blocked forever. Aborting is not a valid release: the host scheduler waits for
+  in-flight tools even on abort, so an abort signal cannot unblock this tool — only
+  the orchestrator redeeming the rendezvous can.
+- **`FAILOVER_HANDED_OFF` is graded `interrupted`**, never `failover`. It means
+  "a human (the main agent) decided to move this route elsewhere"; treating it as a
+  product fault would start a second chain and put two subagents on one task.
+
+The payload now also carries `failoverMode` and `notifyWaitMs`, so the
+orchestrator honours this plugin's settings when both are configured.
 
 The catalog path itself is **not configurable**: `provider-catalog.json` is a
 cross-plugin contract and consumers read the fixed

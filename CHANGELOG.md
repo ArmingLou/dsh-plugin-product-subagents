@@ -1,3 +1,81 @@
+## [0.7.4] — 2026-10-03
+
+配合 dsh-agent-dispatch **1.11.24**：fallback 换档从「自动孙代」改为「主代理显式换档（同级子代理）」。
+本仓只负责**阻塞等裁决并如实转达**；换档的决定权与替补的创建都在编排层。
+
+### Added
+- **`failoverMode`（`auto` | `notify` | `notify-then-auto`，默认 `notify-then-auto`）与
+  `notifyWaitMs`（默认 `90000`）配置**，并随 `product-subagents/submit-failed` 事件下发，
+  编排层据此决定「谁来换档」。三种模式**一律使用同级替补**（主代理的直接子级），
+  差别只在「谁来决定、何时决定」：
+  · `notify-then-auto`：先给主代理机会（`agent_failover`），超时由编排层自动换档；
+  · `notify`：纯手动，超时按失败收尾；
+  · `auto`：不等待，立即换档（保持 0.7.3 的全自动手感）。
+- **`FAILOVER_HANDED_OFF` 错误码**（已归入 `interrupted` 级，绝不判 `failover`）：编排层完成
+  交接后 `product_submit` 的收尾错误。
+- **有界等待的安全网**：编排层自己的 `notifyWaitMs` 计时器是权威；本插件另加
+  `notifyWaitMs + 2s` 的兜底（`finally` 里 `clearTimeout`，正常路径绝不拖住宿主进程），
+  保证**编排层存在却不兑现**时本工具调用不会无限期阻塞。
+
+### Changed
+- **换档裁决的返回契约统一**：`{ handedOff }`（已交接）/ `{ timedOut, summary, message }`
+  （通知模式超时，按失败收尾且信息自解释）/ `{ text }` / `{ exhausted }`（0.7.3 旧编排层，
+  继续兼容）/ `null`（不接管）。
+- `product_submit` 的模块头注释改写为新模型，并显式记录「交接路径**不得**二次 emit
+  `submit-failed`」这条硬约束。
+
+### Fixed
+- **`FAILOVER_HANDED_OFF` 绝不可被当成产品故障**。该码未分级时兜底就是 `failover`
+  （`classifySubmitFailure` 的最后一行），于是交接完成后再跑一条链 ⇒ **同一任务出现两个替补
+  子代理**。现已在 `INTERRUPT_CODES` 中显式列出，与 dsh-agent-dispatch 的 `INTERRUPT_CODES`
+  保持同构。
+
+### Tests
+- `test/submit-failover-handoff.test.js`（新，12 个用例）：`handedOff` 只 emit 一次
+  `submit-failed`、`timedOut` 的自解释文案、载荷里的 `failoverMode` / `notifyWaitMs`
+  （含非法值归一）、旧编排层 `{text}` / `{exhausted}` 兼容、`fatal` 完全不调处理器、
+  安全网在宽限窗口内收尾。
+- `test/submit-failover.test.js`：0.7.3 的既有 12 个用例全部继续通过（向后兼容回归）。
+
+## [0.7.3] — 2026-10-03
+
+### Fixed
+- **fallback 链未走完就向父代理释放失败信号（用户现场两次事故的根因之一，配合 dsh-agent-dispatch 1.11.22）**：
+  产品会话返回**空正文**（`stopReason=completed` 但无任何文本输出）时，宿主
+  `@deepseek-ai/dsh-subagent` 的 `notifySettlement()` 会无条件给父代理发一条
+  `Background subagent <childId> finished and will do no further work unless you send it more.`，
+  而 Activation 结算发生在 relay child 回合结束的**瞬间**，早于编排层据 `subagent/end`
+  做的换档判断。父代理于是先读到「任务已终结」，再看到后台新起一个 child 用同一份任务
+  文本重投，误判失败后手工重派 → 两个同角色子代理并发覆盖同一批文件。
+  **修法**：失败不再立刻抛给 relay child。`product-submissions` 事件载荷新增
+  `onFailover(handler)` 登记口（向后兼容：旧字段一个没删），`product_submit` 在失败时
+  **阻塞等待编排层登记的换档处理器**：换档成功 → 把新档答案当本次答案返回并补发
+  `submit-ok`（本次提交从未失败）；链走完仍失败 → 抛 `FAILOVER_EXHAUSTED` 且错误文本
+  自解释（已尝试哪些 route、各自最后错误）。未登记处理器（对接旧版编排层）时行为与
+  0.3.7 逐字等价。
+- **失败一律当作「可换档」处理**：`onChildEnd` 侧此前把**任何**产品故障都推进 fallback 链，
+  认证失败、参数非法、语法错误这类「重试也不会有改善」的错误也会被换档重跑一遍
+  （白烧请求，还把原因掩盖成「换档已停止」）。新增 `lib/submit-failure.js` 做三档分级：
+  `failover`（限额/限流/空正文/超时/传输中断/5xx → 静默换下一档）、`fatal`
+  （认证/参数/语法/模型不存在/人为拒绝/链已耗尽 → 不换档）、`interrupted`（人为取消）。
+  判定顺序：配置覆盖 → 精确错误码 → 文本正则（先 failover 后 fatal）→ **兜底 failover**，
+  即只有被明确归入 `fatal` 的才停止换档。等级随事件下发给编排层（权威来源）。
+
+### Added
+- `config.submitFailureGrades`：`{ "<错误码>": "failover"|"fatal"|"interrupted" }`，
+  覆盖内置分级（大小写不敏感）。两侧（product-subagents / dsh-agent-dispatch）同名同义。
+- `lib/submit-failure.js`：`classifySubmitFailure(code, message, overrides)`，纯函数、无依赖。
+- `test/submit-failover.test.js`（12 例）：分级的真值表（含 `insufficient_quota` /
+  `余额不足` / `overloaded` / 401 / 403 / schema / 模型不存在 / 余额不足 等边界）+
+  换档握手的 5 条行为断言（无处理器抛裸错 / 空正文成功返回新档答案 / 429 成功返回 /
+  链耗尽抛自解释汇总 / fatal 不调处理器且原样透出原始错误码 / 处理器抛错回落到原错误）。
+
+### Compatibility
+- 向后兼容：未登记 `onFailover` 的监听方（旧版 dsh-agent-dispatch）行为**逐字不变**——
+  照原样抛错，`submit-failed` 载荷只**新增** `grade` 与 `onFailover` 两个字段。
+- `product-subagents` 需要 `dsh-agent-dispatch >= 1.11.22` 才能真正抑制中间态通知；
+  反向搭配（本插件新 + 编排层旧）自动退回旧语义，不会出错。
+
 ## [0.7.2] — 2026-09-29
 
 ### Changed

@@ -116,7 +116,64 @@ config:
   providerProbeOnStart: true  # 启动时只探测已过期的 provider(缓存新鲜时零进程开销)
   providerProbeTimeoutMs: 30000    # 单个 provider 探测硬上限(含 CLI 冷启动);超时则 SIGKILL 该子进程、
                                    # 写 error 条目,且不进行第二次重试
+  # v0.7.3 提交失败分级(默认口径见 lib/submit-failure.js):
+  #   failover    → 编排层可以静默换下一档 routes
+  #   fatal       → 不换档,直接作为最终失败上报
+  #   interrupted → 人为中断/取消,既不算产品故障也不重试
+  # 未列出的错误码兜底为 failover——只有被明确归入 fatal 的那一类才停止换档。
+  submitFailureGrades:
+    EMPTY_RESPONSE: failover      # 产品返回了空正文
+    RATE_LIMITED: failover        # 429 / rate limit / quota / insufficient_quota / 余额不足
+    SUBMIT_TIMEOUT: failover
+    INVALID_API_KEY: fatal        # 认证失败:重试不会改善
+    INVALID_ARGUMENT: fatal       # 参数非法:重试不会改善
+    SYNTAX_ERROR: fatal
+    MODEL_NOT_FOUND: fatal
+    RECONNECT_BLOCKED: fatal
+  # v0.7.4 换档交接模式。三种模式一律使用【同级】替补档(主代理的直接子级),
+  # 差别只在「谁来决定、何时决定」:
+  #   notify-then-auto(默认) → 发唤醒信号 + 暴露 agent_failover,等 notifyWaitMs;
+  #                            超时则由编排层自动派同级替补
+  #   notify                 → 纯手动:只等主代理;超时按失败收尾,绝不自动换档
+  #   auto                   → 不等待、不发信号,立即换档(保持 0.7.3 的全自动手感)
+  failoverMode: notify-then-auto
+  notifyWaitMs: 90000            # 等主代理决定的上限
 ```
+
+## 提交失败分级与换档交接
+
+`product_submit` 在抛错前先给每次提交失败定级,并把等级随
+`product-subagents/submit-failed` 事件下发(载荷字段 `grade`)。同一载荷上还有
+`onFailover(handler)`:监听方可在 **emit 期间同步登记**一个处理器,`product_submit`
+随后 **阻塞等待该处理器** 而不是直接抛错。这正是「换档未走完不向父代理泄漏
+中间态失败」的实现支点——失败档的回合仍然开着(宿主 `watchSettlement` 在算
+`settlementState()` 之前先 `await whenIdle()`),宿主就不会结算它。
+
+v0.7.4 起,**换档决定权归主代理、替补档是主代理的直接子级**,因此本档只可能被
+「交接」或「判失败」,不再拿替补的答案当本次返回值。
+
+| 处理器返回 | `product_submit` 的行为 |
+|---|---|
+| `{ handedOff: true, nextProvider, newChildId }` | 抛 `FAILOVER_HANDED_OFF`:本档到此为止——编排层已终止它并派出**主代理的直接子级**作为替补。**不**再 emit 第二次 `submit-failed`(该未知码兜底分级是 `failover`,会重复登记 `onFailover` 并再跑一条链 ⇒ 同一任务两个替补),也**不**补发 `submit-ok` |
+| `{ timedOut: true, summary, message }` | 抛 `FAILOVER_EXHAUSTED`,`message` 自解释:已尝试哪些档、各自最后错误、**以及为什么没有换档** |
+| `{ text }` | **旧编排层**(≤0.7.3):把 `text` 当作本次提交的答案返回,并补发 `submit-ok`(`viaFailover: true`) |
+| `{ exhausted: true, message }` | **旧编排层**:抛 `FAILOVER_EXHAUSTED`,`message` 自解释 |
+| 抛错 | 记日志后回落到原始提交错误——编排层的故障绝不被报成「路由链耗尽」 |
+| 未登记处理器 | 抛原始错误,与 0.3.7 行为逐字一致 |
+
+只有 `failover` 级失败才会询问处理器;`fatal` / `interrupted` 一律直接抛出。
+
+两条需要显式记录的硬约束:
+
+- **等待是有界的,且不 race `exec.signal`。** 权威计时器在编排层(它的 `notifyWaitMs`),
+  本插件另加一道 `notifyWaitMs + 2s` 的安全网(`finally` 里 `clearTimeout`,正常路径绝不
+  拖住宿主进程),只为保证「编排层存在却不兑现」时本工具调用不会**无限期阻塞**。
+  abort 不是有效的释放手段:宿主调度器即使 abort 也等 in-flight 工具 settle,abort 信号
+  解不开本工具——只有编排层兑现 rendezvous 才行。
+- **`FAILOVER_HANDED_OFF` 定级为 `interrupted`,绝不是 `failover`。** 它的语义是
+  「人(主代理)已决定把这一档挪到别处」;当成产品故障就会再跑一条链,让同一任务出现两个子代理。
+
+事件载荷现在还带 `failoverMode` 与 `notifyWaitMs`,编排层据此采用本插件的设置。
 
 目录路径本身**不可配置**:`provider-catalog.json` 是跨插件契约,消费方按固定路径
 `$DSH_HOME/data/dsh-plugin-product-subagents/provider-catalog.json` 读取。

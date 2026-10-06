@@ -307,6 +307,11 @@ npm run lint    # 语法检查所有模块
 
 桥契约、权限模型与新增产品的方式见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。CI 在 macOS / Ubuntu / Windows × Node 18/20/22 上跑测试套件。
 
+> **拿冻结包冒烟时注意：** 交付用的冻结包**不含 `node_modules`**。直接解包跑
+> `node --test` 会因缺依赖得到 `195/16`（缺 `@agentclientprotocol/sdk` / `zod`）；
+> 要么把解包目录指到本仓 `node_modules`
+> （`ln -s <repo>/node_modules <解包目录>/node_modules`），要么直接在仓库里跑套件。
+
 ## 安全
 
 这是**配置即信任边界**的工具:它会启动你配置的任何 CLI,`full` 会传递产品自己的"绕过所有权限检查"标志。见 [SECURITY.md](SECURITY.md)。

@@ -368,6 +368,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the bridge contract, the
 permission model, and how to add products. CI runs the suite on macOS /
 Ubuntu / Windows × Node 18/20/22.
 
+> **Smoke-testing a freeze tarball:** the frozen delivery archive does **not** contain
+> `node_modules`. Unpacking it and running `node --test` there fails with missing
+> dependencies (`195/16` — no `@agentclientprotocol/sdk` / `zod`); either point the
+> unpacked copy at this repo's `node_modules`
+> (`ln -s <repo>/node_modules <unpacked>/node_modules`) or run the suite inside the repo.
+
 ## Security
 
 This is a **configuration-as-trust-boundary** tool: it spawns whatever CLIs

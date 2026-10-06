@@ -290,8 +290,9 @@ describe('v0.7.9 统一评估器：来源合成与工作区默认规则', () => 
 // ── v0.7.9 缺口A/B 纯函数层 ───────────────────────────────────────────────────
 //
 // 接线层用例在 test/permission-handler-wiring.test.js（断言的是"实际写进了什么"）。
-// 这一层只测判据本身：客户端不可信 ⇒ 逐条校验并如实报告丢弃原因；三条出口互斥且
-// 只有三条；预填目录的取父规则与授权写入解耦（后者绝不消费前者的输出）。
+// 这一层只测判据本身：客户端不可信 ⇒ 逐条校验并如实报告丢弃原因；四条出口互斥且
+// 只有四条（`legacy` / `paths` / `tools` / v0.7.10 新增的 `none`）；预填目录的取父
+// 规则与授权写入解耦（后者绝不消费前者的输出）。
 
 describe('缺口A：validateDeclaredPaths 逐条校验（不可盲信客户端）', () => {
   it('未给 ≠ 空数组：前者 given:false（走自动分析），后者 given:true + declared:[]（走工具档）', () => {
@@ -343,7 +344,7 @@ describe('缺口A：validateDeclaredPaths 逐条校验（不可盲信客户端�
     assert.equal(home === '/', false, '本用例的前提是 home 不是根目录')
   })
 
-  it('全部非法 ⇒ declared 为空数组（调用方据此走工具档，绝不落一条空路径规则）', () => {
+  it('全部非法 ⇒ declared 为空数组（调用方据此走 v0.7.10 的 none 出口，绝不落一条空路径规则）', () => {
     const r = validateDeclaredPaths(['/', 'rel', ''])
     assert.equal(r.given, true)
     assert.deepEqual(r.declared, [])
@@ -351,7 +352,7 @@ describe('缺口A：validateDeclaredPaths 逐条校验（不可盲信客户端�
   })
 })
 
-describe('缺口A：planGrantWrites 只有三条出口，且 paths/tools 互斥', () => {
+describe('缺口A：planGrantWrites 只有四条出口，且 paths/tools 互斥', () => {
   const auto = ['/Users/x/a.txt', '/etc/hosts']
 
   it('出口一 legacy：未给 ⇒ 自动分析结果原样透传（不过滤、不重排、同一数组引用）', () => {
@@ -382,11 +383,26 @@ describe('缺口A：planGrantWrites 只有三条出口，且 paths/tools 互斥'
     assert.equal(p.toolKey, 'qoder:bash')
   })
 
-  it('全非法 ⇒ 走出口三但保留丢弃记录', () => {
+  it('出口四 none（v0.7.10 收口）：声明集非空但全被丢弃 ⇒ 两档都不写，且如实带回 dropped', () => {
     const p = planGrantWrites(['/', 'rel'], auto, { product: 'qoder', toolName: 'Bash' })
-    assert.equal(p.mode, 'tools')
-    assert.equal(p.toolKey, 'qoder:bash')
-    assert.equal(p.dropped.length, 2)
+    assert.equal(p.mode, 'none', '旧行为（退到 tools 档）会把"目录声明被拒"静默放大成整个工具跨任意路径授权')
+    assert.equal(p.toolKey, null, 'none 档不得留下任何工具授权键的投影')
+    assert.deepEqual(p.paths, [], 'none 档一条路径都不写')
+    assert.equal(p.dropped.length, 2, '丢弃记录必须如实带回，调用方据此向 UI/日志交代')
+    assert.deepEqual(p.dropped.map((d) => d.reason), ['根目录', '非绝对路径'])
+    assert.equal(p.source, 'user')
+    assert.equal(p.expand, false)
+  })
+
+  it('none 与 tools 的分界：只有**明确**回传空集才走 tools（逐行删空是用户明示意图）', () => {
+    const empty = planGrantWrites([], auto, { product: 'qoder', toolName: 'Bash' })
+    assert.equal(empty.mode, 'tools', '用户把目录逐行删空 ⇒ 既有语义不变，落工具档')
+    assert.equal(empty.toolKey, 'qoder:bash')
+    assert.deepEqual(empty.dropped, [], '空集没有"被丢弃的声明"可言')
+    const whitespaceOnly = planGrantWrites(['  '], auto, { product: 'qoder', toolName: 'Bash' })
+    assert.equal(whitespaceOnly.mode, 'none', '回传了一条空字符串也算"声明了东西但被丢弃"')
+    assert.equal(whitespaceOnly.dropped.length, 1)
+    assert.equal(whitespaceOnly.toolKey, null)
   })
 
   it('出口三 + 工具名解析不出来 ⇒ toolKey=null（调用方据此报"实际什么都没写"）', () => {
@@ -397,12 +413,16 @@ describe('缺口A：planGrantWrites 只有三条出口，且 paths/tools 互斥'
     }
   })
 
-  it('互斥不变式：mode 为 paths ⇔ toolKey 为 null；mode 为 tools ⇒ paths 必空', () => {
+  it('互斥不变式：mode 为 paths ⇔ toolKey 为 null；mode 为 tools ⇒ paths 必空；none ⇒ 两档皆空', () => {
     for (const given of [[], ['/a'], ['/', 'rel'], undefined]) {
       const p = planGrantWrites(given, auto, { product: 'qoder', toolName: 'Bash' })
       if (p.mode === 'paths') assert.equal(p.toolKey, null, 'paths 档绝不带工具键')
       if (p.mode === 'tools') assert.deepEqual(p.paths, [], 'tools 档绝不带路径')
-      assert.ok(['legacy', 'paths', 'tools'].includes(p.mode), '只有三条出口')
+      if (p.mode === 'none') {
+        assert.equal(p.toolKey, null, 'none 档绝不带工具键')
+        assert.deepEqual(p.paths, [], 'none 档绝不带路径')
+      }
+      assert.ok(['legacy', 'paths', 'tools', 'none'].includes(p.mode), '只有这四条出口')
     }
   })
 })

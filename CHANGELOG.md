@@ -1,3 +1,196 @@
+## [0.7.10] — 2026-10-06
+
+安全收口版：修掉一处**已复现的授权放大**（用户声明被拒的目录 ⇒ 旧逻辑退化成
+「整个工具跨任意路径授权」），并把既有的六条授权语义用测试钉死。**未新增授权档位、
+未放宽任何放行条件**——放行侧（危险命令门、工具档判定在路径之前、`cwdOk` 约束、
+`product` 进键、`permId` FIFO、user-allowlist 落盘语义）逐字未动。
+
+### Fixed
+
+- **`planGrantWrites` 新增第四条出口 `mode: 'none'`（新分支 `lib/permission-rules.js:379-383`；
+  该函数的 JSDoc 起于 `:337`）**。
+  改前判定只看 `declared.length`：声明集为空就一律退到 `tools` 出口 ⇒ 落
+  `<product>:<toolName>` 工具档。危害链（已复现）：用户在弹框里声明 `./x.txt`
+  （非绝对路径**被服务端丢弃**）⇒ `declared` 为空 ⇒ 旧逻辑落 `qoder:read`/`qoder:bash`
+  工具档 ⇒ 用户以为只授权了一个目录，实际拿到**整个工具跨任意路径**的授权 ⇒ 随后
+  `cat /etc/passwd` **allow、零弹窗**。
+  改后条件：`check.given === true && check.declared.length === 0 && check.dropped.length > 0`
+  ⇒ **路径档与工具档都不写**（`paths: []`、`toolKey: null`），仅放行/询问本次，并把
+  `dropped`（原文 + 丢弃原因）如实带回调用方。
+  - **只有客户端明确回传空 `paths: []`（用户逐行删空）才走既有 `tools` 出口**——判据是
+    「给了、声明集为空、且**没有任何条目被丢弃**」，这条语义一字未改（由
+    `test/permission-handler-wiring.test.js` 的对照用例「空 `paths: []` ⇒ 仍走 tools 档」钉住）。
+    同理，回传 `['  ']`（一条空白）算「声明了东西但被丢弃」⇒ `none`。
+  - 接线（`lib/index.js`）：`writePathTier`/`writeToolTier` 两个布尔量从否定式
+    （`mode !== 'tools'` / `mode !== 'paths'`）改为**肯定式**
+    （`mode === 'legacy' || mode === 'paths'` / `mode === 'legacy' || mode === 'tools'`）
+    ——旧写法会让新的 `none` 出口同时落进两条写入分支，正是要收口的那个放大。
+    `allow-session` 走 `mode === 'none'` 专属分支（`allowed-once`，两档都不写）；
+    `allow-always` 下 `diskRule = null`（既不落路径档也不落工具档，outcome
+    `granted-once-fallback`——**该 outcome 取值 0.7.9 既有**，本版只是多了一条走到它的
+    原因，不是新取值）。**决议事件**（`product-subagents/permission-resolved`）
+    在 `none` 档**且用户选择放行时**（正枚举 `allow-once`/`allow-session`/`allow-always`）额外带三个**增量**键——`grantTier: 'none'`、
+    `grantReason: '用户声明的路径一条都没通过服务端校验 ⇒ 路径档与工具档一律未写（仅放行本次）'`、
+    `grantDropped: [{reason, value}…]`——既有键（`childId`/`product`/`permId`/`categoryKey`/`at`/`outcome`）
+    一个都没改；两处日志也都带**被丢弃的原文与原因**（例如 `非绝对路径(./x.txt)`），
+    用户必须看得出「路径被拒、所以什么都没记住」，不得静默
+    （会话档：`档位=none（…）` + `一条都没通过服务端校验（丢弃 N 条：…）`；
+    落盘档：`总是允许落盘失败(…一条都没通过服务端校验（丢弃 N 条：…）⇒ 路径档与工具档一律不落盘)`）。
+    - **边界（终审 M-1 修复）**：三个增量键最初按 `plan.mode === 'none'` **无条件**附加，
+      不分按钮 ⇒ 用户点「拒绝」时载荷也带 `grantReason: '…（**仅放行本次**）'`——请求
+      根本没被放行，是与事实相反的文案（兄弟仓正在给它写渲染逻辑，属定时炸弹）。
+      现在改为**与同文件 `:683` 同形的正枚举**：`plan.mode === 'none' && (button === 'allow-once'
+      || button === 'allow-session' || button === 'allow-always')`——只有明确枚举的三个放行取值才带键，
+      **`deny` 与任何未知取值一律回老形状 `{ outcome }`，一个增量键都不带**（终审 N-B：否定式
+      `button !== 'deny'` 与 `:683` 的判定在「未知取值」上语义相反，今天不可达但下次加第 5 个
+      answer 取值会静默失配），由新用例
+      「边界（终审 M-1）：none 档 + 用户**拒绝** ⇒ 决议载荷不得带放行语义的增量键」钉死
+      （含放行侧对照：同一形状点 `allow-once` 时才带键且 reason 含「仅放行本次」）；
+      **双向变异验证**（`MUT8a` 放宽成恒真 / `MUT8b` 收窄成只认 `allow-once`）都能把用例
+      打红，读数见下表第 ⑦ 行。
+  - `planGrantWrites` 的 JSDoc 出口清单与说明同步改为**四条**（含 `none` 的语义与
+    「为什么不得代偿」）；`validateDeclaredPaths` 的 JSDoc（`lib/permission-rules.js:288`）
+    原本仍写着被本版废除的旧契约「全被丢弃 ⇒ 与 `[]` 同义（只写工具档）」，一并改为
+    与新语义一致（终审 M-2）。
+  - 顺手清掉一处本版引入的死码（终审 m-3）：`lib/index.js:528` 的兜底对象恢复为
+    0.7.9 既有的单值 `reason: 'plan-tools-only'`——`mode === 'none'` 时 `stored.reason`
+    从不被读取（none 有自己的打印分支），原先新增的 `'plan-none-no-tier'` 是不可达字符串。
+- 旧行为被钉死的用例改掉三处（改前/改后原文见下节「断言变更表」）：
+  `test/permission-handler-wiring.test.js:1778`「全非法 ⇒ 与 [] 同义（落工具档）」、
+  `test/permission-rules.test.js:385`「全非法 ⇒ 走出口三但保留丢弃记录」、
+  `test/permission-rules.test.js:400`「只有三条出口」的不变式集合。
+
+### 显式设计决定：**不新增「越权档」**（用户已拍板，本版实现即此语义）
+
+`{kind:'other', title:'external_directory', locations:[…]}` 这类**整条请求没有任何工具
+身份**（无 `name`/`toolName`/`_meta`）的越权请求 ⇒ `resolveToolName` 返回 `null` ⇒
+**维持现状：仍然弹窗、不写任何授权键**。本版**不**为它新增任何「越权档/路径范围档」等
+新档位，也不把 `external_directory` 这类权限范围 slug 提升为可写入的授权键。
+
+理由（既有行为已覆盖真实风险面）：当**真实工具名可用**时，越权请求早已被**工具档**
+覆盖（`_meta.qoder.toolName="Bash"` ⇒ `qoder:bash` ⇒ 同会话同名工具自动放行，见不变式①）；
+仅当整条请求里**没有任何工具身份**时，服务端才无法判断"这是哪个工具在越权"，此时保持
+询问是唯一安全的形态——因为把 `external_directory` 写成授权键等于「任意工作区外路径
+放行」（0.7.7 的静默放行缺陷，0.7.8 已修）。本版把这条语义用不变式②钉死：
+opencode/deveco 载荷形态 ⇒ 仍弹窗、`toolGrants` 与路径规则一笔不写，且换另一条外部
+路径**必须重新询问**。
+
+### 新增不变式用例（`test/permission-handler-wiring.test.js` 的
+`describe('v0.7.10 授权不变式（六条 + 终审 M-1 边界）')`，每条都做过「改回旧行为 ⇒ 必须转红」验证）
+
+| # | 不变式 | 用例名 | 变异点（改回旧行为） | 实测读数（变异→恢复） |
+|---|--------|--------|----------------------|-----------|
+| ① | 工具档命中 + 真实工具名的越权请求 ⇒ 自动放行 | `不变式①：工具档命中 + 真实工具名的越权请求 ⇒ 自动放行（既有行为，钉死）` | `lib/permission-rules.js` `ruleCoversRequest` 的工具档判定 `if (cwdOk && Array.isArray(r.tools) …)` → `if (false && …)` | 转红 `exit=1 #tests 2 #pass 1 #fail 1`（`不变式①` 失败）→ 恢复后 `2/2/0` |
+| ② | 整条请求无工具身份 ⇒ 仍弹窗且不写授权键 | `不变式②：整条请求没有任何工具身份 ⇒ 仍弹窗且不写任何授权键（显式设计决定，不新增越权档）` | `lib/permission-state.js` `resolveToolName` 的 title 分支三重过滤整条去掉（`if (titleSlug)`，恢复 0.7.7「title 即工具名」） | 转红 `exit=1 #tests 2 #pass 0 #fail 2`（`不变式②` 与既有 `不变式②③` 双双失败）→ 恢复后 `2/2/0` |
+| ③ | 危险命令 + 工具档命中 ⇒ 仍弹 | `不变式③：危险命令 + 工具档命中 ⇒ 仍弹（危险门先于一切规则）` | `lib/index.js` 危险门 `const danger = dangerousExecuteMatch(toolCall)` → `const danger = null` | 转红 `exit=1 #tests 1 #pass 0 #fail 1` → 恢复后 `1/1/0` |
+| ④ | 跨 product ⇒ 不互相放行 | `不变式④：跨 product ⇒ 工具档不互相放行` | `lib/permission-rules.js` `toolGrantKey` 忽略 product 前缀（`return t`） | 转红 `exit=1 #tests 1 #pass 0 #fail 1` → 恢复后 `1/1/0` |
+| ⑤ | cwd 不匹配 ⇒ 不放行 | `不变式⑤：cwd 不匹配 ⇒ 工具档不放行` | `lib/permission-rules.js` `ruleCoversRequest` 的 `const cwdOk = !r.cwd \|\| sameCwd(…)` → `const cwdOk = true` | 转红 `exit=1 #tests 1 #pass 0 #fail 1` → 恢复后 `1/1/0` |
+| ⑥ | 声明了非空路径但全被丢弃 ⇒ `mode:'none'`、不写任何档 | `不变式⑥：声明了非空路径但全被丢弃（./x.txt 复现形态）⇒ 两档都不写，随后的 cat /etc/passwd 仍弹` | `lib/permission-rules.js` `planGrantWrites` 的 `none` 分支条件加 `false &&`（恢复「declared 为空 ⇒ tools」） | 转红 `exit=1 #tests 2 #pass 1 #fail 1`（`不变式⑥` 失败）→ 恢复后 `2/2/0` |
+| ⑦ | （终审 M-1 边界）`none` 档 + **拒绝** ⇒ 决议载荷不带放行语义的增量键 | `边界（终审 M-1）：none 档 + 用户**拒绝** ⇒ 决议载荷不得带放行语义的增量键` | `lib/index.js` `emitResolved(plan.mode === 'none' && (button === 'allow-once' \|\| button === 'allow-session' \|\| button === 'allow-always')` **双向**变异：`MUT8a` **放宽**成恒真（`plan.mode === 'none'`）、`MUT8b` **收窄**成 `plan.mode === 'none' && button === 'allow-once'` | 双向都转红（整文件 104 例）：`MUT8a` ⇒ `not ok 边界（终审 M-1）…`（deny 载荷里 `grantTier` 泄漏成 `'none'`）`exit=1 #tests 104 #pass 103 #fail 1`；`MUT8b` ⇒ `not ok 不变式⑥…`（`allow-session` 不再带 `grantTier: 'none'`）`exit=1 #tests 104 #pass 103 #fail 1`；两次恢复后 md5 均回到交付字节、`grep MUT8` 残留 0 |
+
+（变异-恢复纪律：变异前先把原文件 md5 记到**独立**文件（`/tmp/psub-0710-mut/baseline-files.md5`），
+`cp -p` 出 pristine 副本后才改原文件；每次恢复后除 `cmp` 外再核对 md5 等于那份独立基线记录、
+并 `grep` 变异标记为 0，避免「pristine 副本被污染 ⇒ 假绿」。七轮（含终审 M-1 边界那轮）
+跑完后终检：`lib/permission-rules.js` / `lib/index.js` / `lib/permission-state.js` /
+两个测试文件的 md5 与独立基线**逐字节一致**，变异标记残留 0 处。终审 N-B 整改后，
+第 ⑦ 条又按**双向**（放宽 `MUT8a` / 收窄 `MUT8b`）在新字节上复跑一次，两次都转红、
+两次都恢复到交付字节（独立基线 `/tmp/psub-0710-mut2/baseline-files.md5`）。）
+
+### 测试与断言变更
+
+- 全量：`npm test` → `# tests 514 / # suites 74 / # pass 514 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`
+  （0.7.9 基线 504/504/0，本版净增 10 条）；`npm run lint` → `lint ok: 56 files`。
+- 断言变更表（改前 → 改后，逐条）：
+  1. `test/permission-handler-wiring.test.js` 「全非法 ⇒ 与 [] 同义（落工具档），且仍打丢弃留痕」
+     → 「v0.7.10 收口：声明集非空但全被丢弃 ⇒ 两档都不写（工具档绝不代偿），且如实回传丢弃原因」。
+     改前断言 `toolRules(...).map(r => r.tools)` 为 `[['bash']]`、日志 `档位=tools 来源=用户给定空集`；
+     改后断言 `rules.toolGrantSize(...) === 0`、`toolRules(...)` 为空、outcome `allowed-once`、
+     日志 `档位=none（用户声明的路径一条都没通过服务端校验 ⇒ 路径档与工具档一律不写，仅放行/询问本次）`
+     + 丢弃原因逐条（`根目录(/)`、`非绝对路径(rel)`、`空字符串()`），并新增「换任意路径必须重新弹窗」。
+     理由：旧断言把**放大行为**钉成了期望值。
+  2. `test/permission-rules.test.js` 「全非法 ⇒ 走出口三但保留丢弃记录」（`mode === 'tools'`、
+     `toolKey === 'qoder:bash'`）→ 「出口四 none（v0.7.10 收口）」（`mode === 'none'`、
+     `toolKey === null`、`paths === []`、`dropped` 原因逐条）。理由同上。
+  3. `test/permission-rules.test.js` 互斥不变式集合 `['legacy','paths','tools']` →
+     `['legacy','paths','tools','none']`，并补 `none` 档「两档皆空」断言；describe 名
+     「只有三条出口」→「只有四条出口」。纯扩容，无既有断言被削弱。
+  4. `test/permission-rules.test.js` `validateDeclaredPaths` 用例**标题**（非断言）：
+     「调用方据此走工具档」→「调用方据此走 v0.7.10 的 none 出口」。
+  5. 新增对照用例「客户端明确回传空 `paths: []` ⇒ 仍走 tools 档（既有语义不变）」与
+     「`allow-always` + 全被丢弃 ⇒ 会话档与落盘档都不写」，保证「用户逐行删空」这条
+     既有语义没被本轮收口误伤。
+  6. 终审轮补充（**无既有断言被改**，仅新增/改注释）：
+     - 新增 `边界（终审 M-1）：none 档 + 用户**拒绝** ⇒ 决议载荷不得带放行语义的增量键`
+       （deny 侧：三个增量键全部 `undefined` 且载荷不含「仅放行本次」；放行侧对照：
+       `allow-once` 仍带 `grantTier:'none'` 且 reason 含「仅放行本次」）。
+     - `test/permission-rules.test.js` 文件头注释「三条出口互斥且只有三条」→「四条出口
+       互斥且只有四条（`legacy`/`paths`/`tools`/v0.7.10 新增的 `none`）」（终审 m-1，注释非断言）。
+     - `lib/permission-rules.js:288` `validateDeclaredPaths` 的 JSDoc 删掉旧契约
+       「全被丢弃 ⇒ 与 `[]` 同义（只写工具档）」，改为指向 `planGrantWrites` 的新语义（终审 M-2）。
+- 落盘面一律用注入替身 / `mkdtempSync` 临时目录，**不碰真实 `~/.dsh`**；未部署、未 commit。
+
+### 未做 / 未验证（本轮明确不做）
+
+- `lib/permission-state.js` 的 `isToolNameSlug` 仍是**无调用点的死代码**（本轮不动，
+  仅记录；清理它会改公开导出面，需要单独一轮裁定）。
+- 未在真实 ACP 产品会话上做端到端实机验证（本轮禁止起产品会话/禁止部署）；
+  全部结论来自生产源码切片执行的接线测试 + 纯函数测试。
+- 未验证 DSH 宿主升级后的 `approval.request` 契约变化（与本版无关）。
+- **已知的将来硬化项（终审 m-2：判定「不是新漏洞」，本轮不改）**：非数组形态的 `paths`
+  （如字符串/数字/对象）在 `validateDeclaredPaths` 里 `given=false` ⇒ 走 `legacy` 出口
+  （自动分析 + 工具档同写），与「老客户端不发 `paths`」同一条路。终审判定这**不是本版
+  引入的新漏洞**：老客户端本来就可以省略 `paths` 拿到 legacy，脏载荷并未获得任何新能力；
+  且真实客户端只在 `Array.isArray(paths)` 时才带该键。仅作为将来的硬化项记录（若要收口，
+  应把「给了但不是数组」与「没给」区分开，属公开契约变更，需单独一轮裁定）。
+### 规则语义（读侧）：手写 `allowlist.json` 时到底放行了什么
+
+**纯文档补充**（本节不改变任何一行判定逻辑；下面每一条都在本地按 `file:line` 对着源码复核过，
+引用的是 HEAD `3960048` + 本版工作区改动的字节）。说的是**读侧**语义——手改落盘文件
+（`~/.dsh/data/dsh-plugin-product-subagents/allowlist.json`）时按它理解，不要按「看起来应该更窄」的直觉理解。
+本节的文字**不在**已构建的 `~/.dsh/packages/dsh-plugin-product-subagents-0.7.10.tgz` 里，随下次发版进入发布包。
+
+1. **`tools` 与 `paths` 是「或」（并集），不是收窄。** 一条规则里两者是**两个独立**的放行维度，
+   判定顺序**先 `tools` 后 `paths`**（`lib/permission-rules.js:213-225`；顺序说明见 `:199-201`）：
+   `tools` 命中就**立刻返回**（`lib/permission-rules.js:216-218`，`return { hit: true, via: 'tools', … }` 在 `:217`），
+   **完全不看 `paths`**——该工具在该 `cwd` 下**任意路径**都放行；只有 `tools` 不命中才回落到 `paths` 分支，
+   按目录子树判（`lib/permission-rules.js:221-225`）。⇒ 手写一条**两个字段都非空**的规则 =
+   **两者并集，比任一单独都更宽**；它不是「这个工具只在这些路径里放行」。
+2. **「`paths` / `tools` 二选一」是写入侧的构造约定，不是读侧的保证。** 写入侧只有一个判定点
+   `planGrantWrites`（`lib/permission-rules.js:369-388`，出口清单与理由见 JSDoc `:337-368`），落盘点
+   `lib/index.js:599-608` 每个分支**只落一个字段**：`none` ⇒ 一个都不落（`:599-600`）；
+   `tools` ⇒ `tools: [plan.toolKey]`（`:601-604`）；`legacy` / `paths` ⇒ `paths: plan.paths`（`:605-608`）。
+   但读侧**不校验互斥**：`readUserAllowlist` 只要求「`paths` **或** `tools` 至少一个非空」
+   （`lib/user-allowlist.js:62-64`），`appendUserRule` 只在**两者全空**时拒绝
+   （`lib/user-allowlist.js:85`）。⇒ 手改文件时「两个都非空」**完全合法**（会被正常读入），
+   并按第 1 条的并集语义生效。
+3. **`cwd` 是整条规则的前门，`tools` 也救不回来。** 三条分支（`tools` / `paths` / `categories`）共用同一个前门
+   `const cwdOk = !r.cwd || sameCwd(r.cwd, req.cwd, fsImpl)`（`lib/permission-rules.js:213`；用量见
+   `:214` / `:221` / `:226`）。`sameCwd`（`lib/permission-rules.js:192-197`）是两侧各自
+   `resolveRealPath` 之后的**字符串全等**（同一目录的不同写法 / 软链入口不算两个项目；任一侧解析不出即 false）。
+   `cwd` 不匹配 ⇒ **整条规则失效**，`tools` 命中也不放行。规则**不写** `cwd` 才按通配（前门恒真）。
+4. **`product` 只隔离 `tools` 档，不隔离 `paths` 档（不对称，最容易被误解）。** `tools` 分支的命中键由
+   `toolGrantKey(req.product, req.toolName)` 现算（`lib/permission-rules.js:215`），与规则侧
+   `compileRuleTools(r.tools, r.product)` 比对（`:216`）；规则里的**裸名**靠规则自带的 `r.product` 补前缀
+   （`lib/permission-rules.js:169-189`，补前缀在 `:185`），补不出前缀的裸名被丢弃而不是匹配所有产品。
+   而 `paths` 分支（`lib/permission-rules.js:220-225`）**从头到尾不引用 `product`**（`baseDir` 只取
+   `r.cwd || req.cwd`）。⇒ **同一 `cwd` 下，别的 product 授权过的目录子树，也会放行本 product 对该子树的请求**；
+   路径档里没有任何按 product 收窄的手段（要按产品隔离只能用 `tools` 档）。
+5. **`paths` 里放文件路径 = 只放行该文件本身。** `compileRulePath`（`lib/permission-rules.js:97-121`）把每个条目编译成
+   `{ value, kind: 'dir' | 'file' }`，判序是**显式目录写法**（`/a/b/`、`/a/b/**`、`/a/b/*`，`:104-110`）>
+   **磁盘真相**（`statSync`，`:113-115`）> **字面启发式**（basename 无扩展名按目录，`:116`）。
+   匹配在 `pathMatchesClause`（`lib/permission-rules.js:131-137`）：先字符串全等，再
+   `if (clause.kind !== 'dir') return false`（`:134`）。⇒ 文件条目**不会**连父目录（也不会连兄弟文件）
+   一起放行；父目录若需要，必须**被单独列进 `paths`**。
+6. **`note` / `grantedAt` 是纯元数据，不参与任何判定。** `ruleCoversRequest` 只读
+   `cwd` / `tools` / `paths` / `categories`（`product` 仅经第 4 条的键间接参与），见
+   `lib/permission-rules.js:205-233`；写入侧的去重签名也只含 `cwd` / `paths` / `tools`
+   （`lib/user-allowlist.js:86`，两侧列表排序后比较）。⇒ 改 `note` 不改变放行、也不影响去重
+   （同签名仍会合并成一条）；`grantedAt` 只在幂等合并时被刷新（`lib/user-allowlist.js:88-91`）。
+
+> 一句话总结（读侧）：**`cwd` 是前门（不匹配 ⇒ 整条失效，`tools` 也救不回来）→ `tools` 命中即「该 cwd 下任意路径」
+> 放行（按 product 隔离）→ 否则按 `paths` 逐条目判子树（文件条目只放行自身、不放父目录；不按 product 隔离）。**
+
+
 ## [0.7.9] — 2026-10-06
 
 真根因修复：qoder 的**真实工具名不在 `name`/`toolName`/`title` 任何一个里，而在

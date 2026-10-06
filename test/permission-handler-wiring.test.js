@@ -1600,11 +1600,13 @@ describe('v0.7.9 危险命令门：已授权 qoder:bash 后仍须交互询问', 
 // ── v0.7.9 缺口A/B：决策携带 paths（目录子树授权 + paths/tools 互斥）与预填目录 ─────
 //
 // 客户端（dispatch 授权弹框）现在可以在决议里带一个 `paths: string[]`：
-//   · 非空数组 → 授权写入的是**用户给定的那组目录**（目录子树语义），自动分析出的
-//     路径一条都不写，工具名档也不写；
-//   · `[]`     → 路径档一条不写，只写工具名档；
+//   · 非空数组且有条目通过校验 → 授权写入的是**用户给定的那组目录**（目录子树语义），
+//     自动分析出的路径一条都不写，工具名档也不写；
+//   · 非空数组但**一条都没通过校验**（v0.7.10 新增）→ **两档都不写**：用户声明的是
+//     目录，而这些目录全被拒 ⇒ 服务端从未收到「授权整个工具」的意图，不得代偿；
+//   · `[]`     → 路径档一条不写，只写工具名档（用户逐行删空 = 明示要工具档）；
 //   · 缺省     → 完全沿用 0.7.8 之前的自动分析行为（路径档 + 工具档同写）。
-// 三条出口由 `planGrantWrites` 单点决定，本块断言的就是接线后的**实际写入结果**，
+// 四条出口由 `planGrantWrites` 单点决定，本块断言的就是接线后的**实际写入结果**，
 // 而不是那个纯函数的返回值（纯函数的用例在 test/permission-rules.test.js）。
 //
 // 安全口径两条，各有一枚用例钉住：
@@ -1775,17 +1777,64 @@ describe('v0.7.9 缺口A：allow-session + 用户给定 paths ⇒ 只写那些�
     }
   })
 
-  it('全非法 ⇒ 与 [] 同义（落工具档），且仍打丢弃留痕', async () => {
+  it('v0.7.10 收口：声明集非空但全被丢弃 ⇒ 两档都不写（工具档绝不代偿），且如实回传丢弃原因', async () => {
+    // 改前行为（0.7.9 及以前）：`paths: ['/', 'rel', '']` 全被丢弃 ⇒ `declared` 为空 ⇒
+    // 退到 `tools` 出口，落 `qoder:bash` 工具档。危害：用户以为只授权了若干目录（实际
+    // 一条都没落地），却拿到**整个工具跨任意路径**的授权——`cat /etc/passwd` 从此零弹窗。
     const rules = prodRules()
     const h = harness({ bindings: bound(), rules })
     const p1 = h.permissionHandler(bashReq('tc-a1', 'ls -la /Users/x', ['/Users/x/a.txt']))
     await flush()
     h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: ['/', 'rel', ''] })
-    assert.equal(await p1, 'allow')
-    assert.equal(rules.size('parent-1'), 0, '一条合法的都没有 ⇒ 按空集处理，走 tools 档')
-    assert.deepEqual(toolRules(rules, 'parent-1').map((r) => r.tools), [['bash']], '一条合法的都没有 ⇒ 按空集处理，落工具名档')
-    assert.equal(h.logs.filter((l) => l.includes('档位=tools 来源=用户给定空集')).length, 1)
+    assert.equal(await p1, 'allow', '本次请求照常放行（收口只针对"记忆"，不针对"本次"）')
+    assert.equal(rules.size('parent-1'), 0, '路径档一条都不写')
+    assert.equal(rules.toolGrantSize('parent-1'), 0, '工具档也不得写——这是本收口的要害')
+    assert.deepEqual(toolRules(rules, 'parent-1'), [], '没有任何工具档条目')
+    assert.equal(h.resolvedEvents()[0].outcome, 'allowed-once', '什么都没记住 ⇒ 只能算仅本次放行')
+    assert.equal(h.logs.filter((l) => l.includes('档位=none（用户声明的路径一条都没通过服务端校验 ⇒ 路径档与工具档一律不写，仅放行/询问本次）')).length, 1)
     assert.equal(h.logs.filter((l) => l.includes('服务端丢弃非法条目 3 条')).length, 1)
+    const noneLog = h.logs.filter((l) => l.includes('一条都没通过服务端校验')).join('\n')
+    for (const reason of ['根目录(/)', '非绝对路径(rel)', '空字符串()']) {
+      assert.ok(noneLog.includes(reason), `丢弃原因与原文必须如实回给用户/日志（缺 ${reason}）：${noneLog}`)
+    }
+    // 危害复现面：若工具档被写进去，下面这条"完全另一条路径"的命令会被静默放行。
+    const p2 = h.permissionHandler(bashReq('tc-a2', 'cat /etc/passwd', ['/etc/passwd']))
+    await flush()
+    assert.equal(h.pendingEvents().length, 2, '什么都没记住 ⇒ 换任意路径的命令必须重新弹窗（这正是旧行为的放大点）')
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+    assert.equal(await p2, 'deny')
+  })
+
+  it('v0.7.10 收口②：声明集非空但全被丢弃 + allow-always ⇒ 会话档与落盘档都不写', async () => {
+    const rules = prodRules()
+    const captured = []
+    const h = harness({ bindings: bound(), rules, _appendUserRule: (rule) => { captured.push(rule); return { ok: true, count: captured.length } } })
+    const p1 = h.permissionHandler(bashReq('tc-aa1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-always', paths: ['./relative', 'not-absolute'] })
+    assert.equal(await p1, 'allow')
+    assert.deepEqual(captured, [], '落盘不得发生（既不落路径档也不落工具档）')
+    assert.equal(rules.toolGrantSize('parent-1'), 0)
+    assert.equal(rules.size('parent-1'), 0)
+    assert.equal(h.resolvedEvents()[0].outcome, 'granted-once-fallback', '没落盘 ⇒ 只能算"本次放行"')
+    const failLog = h.logs.filter((l) => l.includes('总是允许落盘失败')).join('\n')
+    assert.ok(failLog.includes('一条都没通过服务端校验'), `落盘失败的归因必须说清是路径被拒：${failLog}`)
+    assert.ok(failLog.includes('非绝对路径(./relative)'), `丢弃原文要如实带出：${failLog}`)
+    assert.ok(failLog.includes('不写工具档'), `不得把工具档当兜底代偿：${failLog}`)
+  })
+
+  it('对照（差分）：客户端明确回传空 `paths: []` ⇒ 仍走 tools 档（既有语义不变）', async () => {
+    const rules = prodRules()
+    const h = harness({ bindings: bound(), rules })
+    const p1 = h.permissionHandler(bashReq('tc-a3', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: [] })
+    assert.equal(await p1, 'allow')
+    assert.equal(rules.toolGrantSize('parent-1'), 1, '用户逐行删空 ⇒ 工具档照旧写入')
+    assert.equal(h.logs.filter((l) => l.includes('档位=tools 来源=用户给定空集')).length, 1)
+    const p2 = h.permissionHandler(bashReq('tc-a4', 'ls -la /etc', ['/etc/hosts']))
+    assert.equal(await p2, 'allow', '工具档生效 ⇒ 同会话同名工具换路径免弹')
+    assert.equal(h.pendingEvents().length, 1)
   })
 
   it('paths 缺省 ⇒ 回归守卫：自动分析结果与工具档照旧同写（0.7.8 行为逐字节不变）', async () => {
@@ -2647,5 +2696,203 @@ describe('v0.7.9 第六轮裁定：信封内数组不得把正文路径写进会
     const p2 = h.permissionHandler(req(readFrame, [sshKnownHosts], 'Allow reading known_hosts?'))
     assert.equal(await p2, 'allow', '旧行为下这条请求被静默放行 —— 正是本裁定的危害面')
     assert.equal(h.pendingEvents().length, 1, '第二条没有弹窗（pending 不增加）')
+  })
+})
+
+// ── v0.7.10：授权不变式六条（把既有语义用测试钉死 + 本轮新收口的第 ⑥ 条） ─────────
+//
+// 这一块是 v0.7.10 的**回归钉**：每一条都做了「把旧行为改回去 ⇒ 对应用例必须转红」
+// 的验证（变异点与红/绿读数见 CHANGELOG 0.7.10 的"实验读数"表）。语义本身不变：
+//  ① 工具档命中 + 真实工具名的越权请求 ⇒ 自动放行；
+//  ② **整条请求没有任何工具身份**的越权（opencode/deveco 载荷：无 name/toolName/_meta，
+//     title 是权限范围 slug `external_directory`）⇒ 仍弹窗、且不写任何授权键
+//     —— 「不新增越权档」是用户拍板的**显式设计决定**：真实工具名可用时越权请求已被
+//     工具档覆盖（既有行为），仅当整条请求没有任何工具身份时才保持询问；
+//  ③ 危险命令 + 工具档命中 ⇒ 仍弹（危险门先于一切规则）；
+//  ④ 跨 product ⇒ 不互相放行（`qoder:bash` ≠ `opencode:bash`）；
+//  ⑤ cwd 不匹配 ⇒ 不放行（工具档同样按写入时的 cwd 作用域）；
+//  ⑥ 声明了非空路径但全被服务端丢弃 ⇒ 两档都不写（v0.7.10 收口，旧行为下会静默放大）。
+describe('v0.7.10 授权不变式（六条 + 终审 M-1 边界）', () => {
+  const prodRules = () => createSessionRules({ expand: expandPathsWithParents })
+  const toolRules = (rules, sid) => rules.rulesOf(sid).filter((r) => (r.tools || []).length > 0)
+  /** qoder 形态：真实工具名在 `_meta.qoder.toolName`，`title` 是整条命令正文 */
+  const qoderReq = (toolCallId, command, paths = []) => ({
+    product: 'qoder', sessionId: 'acp-1', description: 'Allow bash?',
+    toolCall: {
+      _meta: { qoder: { toolName: 'Bash' } }, kind: 'execute', title: command,
+      rawInput: { command }, toolCallId,
+    },
+    paths,
+  })
+  /**
+   * opencode/deveco 形态（与 test/permission.test.js:155-163 同形）：整条请求
+   * **没有任何工具身份**——无 `name`/`toolName`/`_meta`，只有 `title=external_directory`
+   * 这个**权限范围 slug**（不是工具名）+ locations/rawInput 描述触达的路径。
+   */
+  const externalDirReq = (toolCallId, filePath, parentDir) => ({
+    product: 'opencode', sessionId: 'acp-1', description: '工作区外路径',
+    toolCall: {
+      kind: 'other',
+      locations: [{ path: filePath }, { path: parentDir }],
+      rawInput: { filepath: filePath, parentDir },
+      status: 'pending',
+      title: 'external_directory',
+      toolCallId,
+    },
+    paths: [filePath],
+  })
+
+  it('不变式①：工具档命中 + 真实工具名的越权请求 ⇒ 自动放行（既有行为，钉死）', async () => {
+    const rules = prodRules()
+    const h = harness({ bindings: bound(), rules })
+    const p1 = h.permissionHandler(qoderReq('tc-i1-1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    assert.equal(h.pendingEvents().length, 1, '首次越权请求必须弹窗')
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: [] })
+    assert.equal(await p1, 'allow')
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/proj'), true, '工具档 qoder:bash 已写入')
+    // 换成**完全另一条越权路径**的同名工具请求 ⇒ 命中工具档，零弹窗
+    const p2 = h.permissionHandler(qoderReq('tc-i1-2', 'cat /etc/passwd', ['/etc/passwd']))
+    assert.equal(await p2, 'allow', '工具档命中 ⇒ 自动放行（本会话内同名工具不再询问）')
+    assert.equal(h.pendingEvents().length, 1, '第二条不得弹窗')
+    assert.equal(h.logs.filter((l) => l.includes('命中会话期工具名授权（Bash')).length, 1, '归因要说清是工具档命中的')
+  })
+
+  it('不变式②：整条请求没有任何工具身份 ⇒ 仍弹窗且不写任何授权键（显式设计决定，不新增越权档）', async () => {
+    const rules = prodRules()
+    const h = harness({ bindings: bound('child-A', { sessionId: 'acp-1' }, { product: 'opencode' }), rules })
+    const p1 = h.permissionHandler(externalDirReq('tc-i2-1', '/Users/arming/.dsh/AGENTS.md', '/Users/arming/.dsh'))
+    await flush()
+    assert.equal(h.pendingEvents().length, 1, '无工具身份 ⇒ 一律询问，不得自动放行')
+    assert.equal(h.pendingEvents()[0].toolName, null, 'resolveToolName=null（无 name/toolName/_meta，title 是权限范围 slug）')
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session' })
+    assert.equal(await p1, 'allow')
+    assert.equal(rules.toolGrantSize('parent-1'), 0, '不写任何工具授权键')
+    assert.equal(rules.toolGrantCovers('parent-1', 'opencode', 'external_directory', '/proj'), false, 'external_directory 永远不能成为授权键')
+    assert.deepEqual(toolRules(rules, 'parent-1'), [], '工具档为空')
+    assert.equal(h.resolvedEvents()[0].outcome, 'granted-session', '落的是路径级记忆（L2），不是工具档')
+    // 换一条完全不同的外部路径 ⇒ 仍须询问（路径记忆只覆盖声明子树，绝不变成"任意外部路径"）
+    const p2 = h.permissionHandler(externalDirReq('tc-i2-2', '/outside/other/file.txt', '/outside/other'))
+    assert.equal(h.pendingEvents().length, 2, '另一条外部路径必须重新询问')
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+    assert.equal(await p2, 'deny')
+  })
+
+  it('不变式③：危险命令 + 工具档命中 ⇒ 仍弹（危险门先于一切规则）', async () => {
+    const rules = prodRules()
+    const h = harness({ bindings: bound(), rules })
+    const p1 = h.permissionHandler(qoderReq('tc-i3-1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: [] })
+    assert.equal(await p1, 'allow')
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/proj'), true, '工具档确实命中')
+    for (const [i, cmd] of ['rm -rf /tmp/build', 'npm publish', 'git push origin main'].entries()) {
+      const p = h.permissionHandler(qoderReq(`tc-i3-${i + 2}`, cmd, []))
+      await flush()
+      assert.equal(h.pendingEvents().length, i + 2, `${cmd} 必须弹窗`)
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[i + 1].permId, answer: 'deny' })
+      assert.equal(await p, 'deny', `${cmd} 必须仍由用户裁决，不被工具档放行`)
+    }
+    assert.equal(h.logs.filter((l) => l.includes('危险命令门命中')).length, 3)
+  })
+
+  it('不变式④：跨 product ⇒ 工具档不互相放行', async () => {
+    const rules = prodRules()
+    const bindings = bound()
+    bindings.set('child-B', { product: 'opencode', remote: { sessionId: 'acp-2' }, cwd: '/proj', parentSessionId: 'parent-1' })
+    const h = harness({ bindings, rules })
+    const p1 = h.permissionHandler(qoderReq('tc-i4-1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: [] })
+    assert.equal(await p1, 'allow')
+    assert.equal(rules.toolGrantSize('parent-1'), 1)
+    // 同一主代理会话、同一个真实工具名 bash，但产品是 opencode ⇒ 授权键不同，不得借键
+    const p2 = h.permissionHandler({
+      product: 'opencode', sessionId: 'acp-2', description: 'Allow bash?',
+      toolCall: { name: 'bash', kind: 'execute', title: 'ls -la /etc', rawInput: { command: 'ls -la /etc' }, toolCallId: 'tc-i4-2' },
+      paths: ['/etc/hosts'],
+    })
+    await flush()
+    assert.equal(h.pendingEvents().length, 2, 'opencode 不得吃到 qoder:bash 的授权键')
+    assert.equal(toolRules(rules, 'parent-1').map((r) => r.product).join(), 'qoder', '工具档仍只属于 qoder')
+    h.onDecision({ childId: 'child-B', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+    assert.equal(await p2, 'deny')
+  })
+
+  it('不变式⑤：cwd 不匹配 ⇒ 工具档不放行', async () => {
+    const rules = prodRules()
+    const bindings = bound()
+    bindings.set('child-B', { product: 'qoder', remote: { sessionId: 'acp-2' }, cwd: '/other-proj', parentSessionId: 'parent-1' })
+    const h = harness({ bindings, rules })
+    const p1 = h.permissionHandler(qoderReq('tc-i5-1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: [] })
+    assert.equal(await p1, 'allow')
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/proj'), true, '授权写在 /proj')
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/other-proj'), false, 'cwd 不同 ⇒ 同一份工具档不算覆盖')
+    // 同一个 qoder 工具、同一个主代理会话，但请求来自另一个工作目录的 child ⇒ 必须弹窗
+    const p2 = h.permissionHandler({
+      product: 'qoder', sessionId: 'acp-2', description: 'Allow bash?',
+      toolCall: { _meta: { qoder: { toolName: 'Bash' } }, kind: 'execute', title: 'cat /etc/passwd', rawInput: { command: 'cat /etc/passwd' }, toolCallId: 'tc-i5-2' },
+      paths: ['/etc/passwd'],
+    })
+    await flush()
+    assert.equal(h.pendingEvents().length, 2, 'cwd 不同 ⇒ 项目级工具档不得命中')
+    h.onDecision({ childId: 'child-B', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+    assert.equal(await p2, 'deny')
+  })
+
+  it('不变式⑥：声明了非空路径但全被丢弃（`./x.txt` 复现形态）⇒ 两档都不写，随后的 cat /etc/passwd 仍弹', async () => {
+    // 已复现的危害（0.7.9 及以前）：用户在弹框里声明 `./x.txt`（非绝对路径被服务端丢弃）
+    // ⇒ 旧逻辑退到 tools 出口、落 `qoder:bash` 工具档 ⇒ 用户以为只授权了一个目录，
+    // 实际拿到整个工具跨任意路径的授权：随后 `cat /etc/passwd` **allow、零弹窗**。
+    const rules = prodRules()
+    const h = harness({ bindings: bound(), rules })
+    const p1 = h.permissionHandler(qoderReq('tc-i6-1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session', paths: ['./x.txt'] })
+    assert.equal(await p1, 'allow', '本次请求照常放行')
+    assert.equal(rules.size('parent-1'), 0, '路径档一条都不写（声明的路径一条都不合法）')
+    assert.equal(rules.toolGrantSize('parent-1'), 0, '工具档也不得代偿——这是收口的要害')
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/proj'), false)
+    assert.equal(h.resolvedEvents()[0].outcome, 'allowed-once', '什么都没记住 ⇒ 只能算仅本次放行')
+    assert.equal(h.logs.filter((l) => l.includes('档位=none（用户声明的路径一条都没通过服务端校验')).length, 1)
+    assert.ok(h.logs.some((l) => l.includes('非绝对路径(./x.txt)')), '丢弃原文与原因必须如实回给用户/日志')
+    // 「如实回给 UI」：决议载荷（增量键）也要带出档位与丢弃原因，不能只躺在宿主日志里
+    assert.equal(h.resolvedEvents()[0].grantTier, 'none', '决议载荷要说明"两档都没写"')
+    assert.deepEqual(h.resolvedEvents()[0].grantDropped, [{ reason: '非绝对路径', value: './x.txt' }], '丢弃条目原文逐条回给 UI')
+    assert.match(String(h.resolvedEvents()[0].grantReason), /路径档与工具档一律未写/)
+    assert.equal(h.resolvedEvents()[0].childId, 'child-A', '既有键（childId/outcome/permId…）一个都没少')
+    // 危害面：旧行为下这条会被 qoder:bash 静默放行（零弹窗）
+    const p2 = h.permissionHandler(qoderReq('tc-i6-2', 'cat /etc/passwd', ['/etc/passwd']))
+    await flush()
+    assert.equal(h.pendingEvents().length, 2, '仍须弹窗（旧行为：零弹窗 allow）')
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+    assert.equal(await p2, 'deny')
+  })
+
+  it('边界（终审 M-1）：none 档 + 用户**拒绝** ⇒ 决议载荷不得带放行语义的增量键', async () => {
+    // 修正前：三个增量键按 `plan.mode === 'none'` **无条件**附加，不分按钮 ⇒ 用户点
+    // 「拒绝」时载荷也带 `grantReason: '…一律未写（仅放行本次）'`——请求根本没被放行，
+    // 这是与事实相反的文案（兄弟仓正在写渲染逻辑，属定时炸弹）。
+    const rules = prodRules()
+    const h = harness({ bindings: bound(), rules })
+    const p1 = h.permissionHandler(qoderReq('tc-i6d-1', 'ls -la /Users/x', ['/Users/x/a.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'deny', paths: ['./x.txt'] })
+    assert.equal(await p1, 'deny', '拒绝就是拒绝')
+    const resolved = h.resolvedEvents()[0]
+    assert.equal(resolved.outcome, 'rejected')
+    assert.equal(resolved.grantTier, undefined, 'deny 时不得带档位键')
+    assert.equal(resolved.grantDropped, undefined, 'deny 时不得带丢弃明细')
+    assert.equal(resolved.grantReason, undefined, 'deny 时不得带放行归因')
+    assert.equal(JSON.stringify(resolved).includes('仅放行本次'), false, 'deny 载荷里不得出现「仅放行本次」这种与事实相反的文案')
+    // 与放行侧对照：同一形状、点「拒绝」以外的按钮时才带增量键
+    const p2 = h.permissionHandler(qoderReq('tc-i6d-2', 'ls -la /Users/y', ['/Users/y/b.txt']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'allow-once', paths: ['./x.txt'] })
+    assert.equal(await p2, 'allow')
+    assert.equal(h.resolvedEvents()[1].grantTier, 'none', '放行侧仍要如实带出"两档都没写"')
+    assert.match(String(h.resolvedEvents()[1].grantReason), /仅放行本次/)
   })
 })

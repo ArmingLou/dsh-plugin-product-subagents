@@ -168,6 +168,91 @@ config:
   notifyWaitMs: 90000            # how long to wait for the main agent's decision
 ```
 
+### Dangerous-command patterns (v0.7.15)
+
+Besides the built-in per-command and structural rules, the dangerous-command gate adds a
+**full-text literal scan**: if the dangerous wording shows up anywhere in the command text
+(commit message, comment, docs, `grep` pattern, …) the request goes back to interactive
+approval. That "mention it and it pops" behaviour is a deliberate user decision — a cost,
+not a bug.
+
+The wording list is **add-only** and takes effect **without restarting**:
+
+`$DSH_HOME/data/dsh-danger-patterns.json` (`$DSH_HOME` defaults to `~/.dsh`):
+
+```json
+{
+  "_readme": "Extra full-text dangerous wording. Literal strings, whitespace- and quote-tolerant.",
+  "patterns": ["deploy --force"]
+}
+```
+
+| Case | Behaviour |
+|---|---|
+| built-in presets (`rm -rf`, `git push`, `npm publish`) | **always active — a config file cannot turn them off** |
+| file missing | equivalent to "no additions" (presets still apply, no warning) |
+| empty file or whitespace-only file | likewise "no additions", **silent** — `touch`ing a template file is normal usage |
+| `{"_readme": "..."}` template, `{}`, or `patterns` missing / `patterns: []` | likewise "no additions", **silent** — the template simply has no additions yet |
+| broken JSON / `patterns` present but **not an array** | likewise "no additions" **plus a one-time warning each** (never "stop judging") |
+| top-level value is not an object — bare array such as `["deploy --force"]`, `null`, a number or a string | likewise "no additions", **silent**: a config with no `patterns` key simply has no additions, so nothing is added and nothing warns (the presets still apply). Warning once for this shape is on the next-version TODO list |
+| `patterns: []` | likewise "no additions" (**not** an off switch) |
+| not a regular file (FIFO, device, directory), or > 1 MB | likewise "no additions" **plus a one-time warning** — the file is **not read at all**. Reading a FIFO or `/dev/zero` would block the synchronous gate forever and freeze the host event loop (the gate runs synchronously before every allow decision). The type check is taken from the **file descriptor** (`open(O_RDONLY\|O_NONBLOCK)` + `fstat`), never from a prior `stat` of the path: a `stat` that reports "regular file" while the path is really a FIFO would still hang, so a non-regular mode is decided from the fd and the fd is closed in `finally` |
+| more than 1024 entries, or a single entry > 4096 chars | the excess entries are **skipped** (with a one-time warning); the rest still apply — a downgrade, never an off switch |
+
+**Shared file, identical caps:** the same `dsh-danger-patterns.json` is read by both this plugin
+and `dsh-agent-dispatch` (which guards the host/native tool-call channel while this one guards the
+ACP/product channel). As of 0.7.15 / 1.12.13 both use the **same three caps** — file ≤ 1 MB,
+**≤ 1024 extra entries**, ≤ 4096 chars per entry — so the two gates cannot disagree about how much
+of a given config they honour (a config with 1000 patterns is fully honoured by both; only beyond
+1024 entries do both start skipping, each with its own one-time warning). **These caps only match
+while the two plugins ship together** — upgrade `dsh-agent-dispatch` to 1.12.13 alongside this
+version; a deployed `dsh-agent-dispatch` 1.12.7 has no config layer at all (the whole
+`dsh-danger-patterns.json` feature is new here), so there is no 256-vs-1024 split in the field
+today. Honest note on the
+coverage change this unification brings: entries **1025–4096 of an oversized config are no longer
+honoured by this plugin** (they were, back when its cap alone was 4096), so a custom pattern sitting
+in that band no longer triggers a prompt here — the presets and the first 1024 entries are
+unaffected, and the earlier `dsh-agent-dispatch` cap of 256 was raised to the same 1024.
+
+`patterns` entries are **appended** to the presets: trimmed, empty ones dropped, duplicates
+(including duplicates of a preset) removed, internal whitespace collapsed; they are matched
+**literally** (never compiled as regular expressions), **case-insensitively** (both the
+configured string and the command text are compared folded to lower case, mirroring
+`dsh-agent-dispatch`'s `i` flag), tolerating arbitrary whitespace and wrapping quotes, with
+word boundaries on both sides. Preset hits are reported as `text:<pattern>`, additions as
+`text:custom:<pattern>` — the attribution keeps the **original** casing of the configured
+string (only the comparison is folded). Additions take effect (and can be removed) live; the
+presets always stay in place. Two module exports exist only as **test seams** and are not part
+of the configuration surface: `foldCase()` (pins the length-preserving folding invariant, i.e.
+`foldCase(x).length === x.length`, that the case-insensitive comparison relies on — length-preserving
+folds such as `ẞ` U+1E9E → `ß` U+00DF take the native fast path and therefore **do** match each
+other, while folds that would grow, e.g. `İ` U+0130 → `i̇`, keep the original character so the
+indices stay aligned and `segment` slices stay byte-exact) and the
+optional explicit table argument of `scanDangerPatterns(text, table)` (a non-empty table
+**replaces** the presets entirely; production only calls it with the default table).
+**Live reload boundary:** the change signature is
+`(mtimeMs, size)`, so an in-place rewrite of the same size within the same millisecond is not
+seen as a change (that one decision keeps the previous table; changing the length or adding a
+space triggers the re-read).
+
+**Text cap (fail-closed):** the full-text layer only scans command text up to
+`MAX_DANGER_TEXT_CHARS` (256 KB). Anything longer is reported as `command-too-long` and
+**still requires approval** — "too long" is never a reason to allow. (Same direction as
+`dsh-agent-dispatch`'s `COMMAND_TOO_LONG_RULE`.)
+
+**Known cross-repo difference (documented, not a defect):** this plugin runs the full-text
+layer at **every** recursion depth of the per-segment judgement, while `dsh-agent-dispatch`
+runs its own only once at depth 0. The top-level call already scans the whole normalized text,
+so the nested calls look redundant — but a nested body is normalized on its own (continuation
+joins, literal `\n`, quote-aware segment splitting), and we have no equivalence proof that
+"nested-normalized body" is always a substring of "top-level-normalized text". Per the review
+rule ("no proof ⇒ keep the status quo"), this stays as is.
+
+**Why it cannot be switched off:** `~/.dsh/data/` is writable, so an "off switch" would let a
+single command disarm the gate by writing an empty list — the opposite of the intended
+"add-only, strictly more conservative" behaviour. Configuration can therefore only make the
+gate **stricter** (worst case: one extra prompt), never looser.
+
 ### Submit-failure grading and in-turn failover
 
 `product_submit` classifies every submission failure before rethrowing it, and

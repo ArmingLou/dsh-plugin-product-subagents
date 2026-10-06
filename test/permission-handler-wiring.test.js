@@ -11,13 +11,13 @@
 // 挂起登记表与会话规则用的是**生产实现**（lib/permission-state.js）。
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { createPendingRegistry, createSessionRules, permissionCategoryKey, resolveToolName } from '../lib/permission-state.js'
-import { dangerousExecuteMatch } from '../lib/dangerous-commands.js'
+import { dangerousExecuteMatch, dangerPatternsPath, resetDangerPatternsCache } from '../lib/dangerous-commands.js'
 import { evaluateRuleSources, inferredDirs, planGrantWrites, suggestedDirs, workspaceRuleOf } from '../lib/permission-rules.js'
 import { extractPaths, extractStructuredPaths, scanPathsLoose } from '../lib/bridges/acp.js'
 import { appendUserRule, readUserAllowlist } from '../lib/user-allowlist.js'
@@ -1541,18 +1541,85 @@ describe('v0.7.9 危险命令门：已授权 qoder:bash 后仍须交互询问', 
     assert.equal(h.logs.filter((l) => l.includes('危险命令门命中')).length, 0, '正常命令不得被门命中')
   })
 
-  it('误伤守卫（端到端）：echo "git push" / echo npm publish / 注释里的 rm -rf 都不算危险', async () => {
+  // v0.7.15（用户裁定）：判定模式从「按段/命令头」改成**全文危险词判定** —— 文本里出现危险字样
+  // 就弹，包括打印/注释/grep 参数里的**提及**。旧用例断言这四条「不得被门拦下」，本裁定作废该口径
+  // ⇒ 翻成"必须各弹一次 + 留痕"，并保留一条**真反例**证明不是"一律弹"。
+  it('提及代价（端到端，用户裁定 v0.7.15）：打印/注释/grep 里的危险字样也必须弹一次', async () => {
     const { h } = await granted()
-    for (const [toolCallId, command] of [
+    const mentions = [
       ['tc-safe-1', 'echo "git push"'],
       ['tc-safe-2', 'echo npm publish'],
       ['tc-safe-3', 'ls; # rm -rf /tmp'],
       ['tc-safe-4', 'grep -rn "git push" docs/'],
-    ]) {
+    ]
+    for (const [i, [toolCallId, command]] of mentions.entries()) {
       const p = h.permissionHandler(bashReq(toolCallId, command, ['/Users/arming/.ssh/id_rsa']))
-      assert.equal(await p, 'allow', `${command} 不得被门拦下`)
+      await flush()
+      assert.equal(h.pendingEvents().length, i + 2, `「${command}」必须弹一次（提及即判，用户裁定的代价）`)
+      assert.equal(h.logs.filter((l) => l.includes('命中会话期工具名授权')).length, 0, '不得走免弹通道')
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[i + 1].permId, answer: 'deny' })
+      assert.equal(await p, 'deny', '必须仍由用户裁决')
     }
-    assert.equal(h.pendingEvents().length, 1, '四条误伤候选都不得弹窗')
+    assert.equal(h.logs.filter((l) => l.includes('危险命令门命中')).length, mentions.length,
+      '每条提及都必须留下归因日志（归因是 text:<串>）')
+    assert.ok(h.logs.some((l) => l.includes('text:rm -rf')), '留痕里应能看到全文判定的归因 id')
+    // 真反例（端到端）：文本里没有任何危险字样 ⇒ 照旧命中工具名授权、免弹
+    const safe = h.permissionHandler(bashReq('tc-safe-5', 'ls -la /tmp', ['/Users/arming/.ssh/id_rsa']))
+    assert.equal(await safe, 'allow', '真反例不得被门拦下')
+    assert.equal(h.pendingEvents().length, mentions.length + 1, '真反例不得新增弹球')
+  })
+
+  // v0.7.15（用户裁定）：危险字样是**配置项**（`$DSH_HOME/data/dsh-danger-patterns.json`），
+  // 可动态**追加**、免重启生效，但**只增不减** —— 内置三串恒生效，配置文件**关不掉**这层判定
+  // （`~/.dsh/data/` 可写，允许关层就等于留了自我解除武装的口子）。本用例走真实 handler：
+  // 追加项改文件立即生效；`[]` / 坏 JSON 都只是"没有追加项"，内置三串照旧弹。
+  it('E2E：危险词配置项只增不减（追加项免重启生效 / [] 与坏 JSON 都关不掉内置三串）', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'psub-danger-'))
+    const prevHome = process.env.DSH_HOME
+    process.env.DSH_HOME = dir
+    resetDangerPatternsCache()
+    try {
+      const { h } = await granted()
+      // ① 没有配置文件 ⇒ 内置三串生效，追加词不判
+      const none = h.permissionHandler(bashReq('tc-cfg-0', 'deploy --force now', ['/tmp/build']))
+      assert.equal(await none, 'allow', '未配置时追加词不判（内置三串不含它）')
+      // ② 写配置 ⇒ 下一次判定立即生效（mtime+size 变更重读，不需要重启）
+      const file = dangerPatternsPath()
+      assert.equal(file, path.join(dir, 'data', 'dsh-danger-patterns.json'), '配置路径与规格一致')
+      mkdirSync(path.dirname(file), { recursive: true })
+      writeFileSync(file, JSON.stringify({ patterns: ['deploy --force'] }))
+      const custom = h.permissionHandler(bashReq('tc-cfg-1', 'deploy --force now', ['/tmp/build']))
+      await flush()
+      assert.equal(h.pendingEvents().length, 2, '追加词必须弹（免重启生效）')
+      assert.ok(h.logs.some((l) => l.includes('text:custom:deploy --force')), '归因是 text:custom:<原串>')
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+      assert.equal(await custom, 'deny')
+      // ③ `patterns: []` = "没有追加项"（**不是关闭**）：内置三串的提及照样弹
+      writeFileSync(file, JSON.stringify({ patterns: [] }))
+      const afterEmpty = h.permissionHandler(bashReq('tc-cfg-2', 'echo "git push"', ['/tmp/build']))
+      await flush()
+      assert.equal(h.pendingEvents().length, 3, '`patterns: []` 不得关层：内置三串仍须弹一次')
+      assert.ok(h.logs.some((l) => l.includes('text:git push')), '归因仍是内置 id `text:git push`')
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[2].permId, answer: 'deny' })
+      assert.equal(await afterEmpty, 'deny')
+      // ④ 删掉追加项（仍在同一份文件里改）⇒ 追加项立刻失效，内置三串仍在
+      writeFileSync(file, JSON.stringify({ patterns: ['something-else'] }))
+      const gone = h.permissionHandler(bashReq('tc-cfg-3', 'deploy --force now', ['/tmp/build']))
+      assert.equal(await gone, 'allow', '追加项删掉后立刻失效（动态性只作用于追加项）')
+      // ⑤ 坏 JSON ⇒ 同样只是"没有追加项"（不因读取失败变成"不判"）
+      writeFileSync(file, '{ broken json')
+      resetDangerPatternsCache() // 同尺寸同毫秒的极端场景；生产由 mtime+size 负责
+      const broken = h.permissionHandler(bashReq('tc-cfg-4', 'echo "npm publish"', ['/tmp/build']))
+      await flush()
+      assert.equal(h.pendingEvents().length, 4, '坏 JSON ⇒ 内置三串仍须弹一次')
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[3].permId, answer: 'deny' })
+      assert.equal(await broken, 'deny')
+    } finally {
+      resetDangerPatternsCache()
+      if (prevHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = prevHome
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('非 execute 工具不受门影响：Write 载荷里带 rm -rf 字样也照常免弹', async () => {
@@ -1594,6 +1661,111 @@ describe('v0.7.9 危险命令门：已授权 qoder:bash 后仍须交互询问', 
     const p4 = h.permissionHandler(bashReq('tc-d-3', 'ls -la /tmp', ['/Users/arming/.dsh/x']))
     assert.equal(await p4, 'allow')
     assert.equal(h.pendingEvents().length, 3, '正常命令仍不弹窗')
+  })
+  // v0.7.13：**内容规则与形状判据都对整段文本生效（含载荷行）、归因先内容后形状** 的端到端证据。
+  //
+  // 现场：先正常授权 `qoder:bash`（会话级**工具名**授权，不看路径），随后一条载荷里带真命令 /
+  // 深嵌套包装的命令。0.7.12 的「载荷行豁免」按归因 id 生效，而形状分支会**直接返回形状规则、
+  // 不再求值内容规则** ⇒ 这类帧判 `null` ⇒ `lib/index.js` 的 `!danger` 分支把 session/disk/
+  // workspace 三档全部推入 ⇒ **零弹框零留痕静默放行**（终审 E2E 实测 7 条 SILENT_ALLOW）。
+  // 本用例钉住：这类帧必须再弹一次（不得 allow），归因日志 ≥1、免弹日志 0。
+  it('E2E：载荷里的真命令 / 深嵌套包装 ⇒ 已授权 qoder:bash 也必须再弹一次（不得静默放行）', async () => {
+    const { h, rules } = await granted()
+    const shapes = [
+      // 内容规则命中（载荷里写脚本再执行、进程替换、承载者开关、同名程序、解释器）
+      "cat > /tmp/psub-g.sh <<'SH'\nrm -rf /tmp/build\nSH\nsh /tmp/psub-g.sh",
+      "cat <<'SH' > >(sh)\nrm -rf /tmp/build\nSH",
+      "tar --use-compress-program=sh -xf - <<'TAR'\nrm -rf /tmp/build\nTAR",
+      "/tmp/plant/cat <<'SH'\nrm -rf /tmp/build\nSH",
+      "pwsh -Command - <<'P'\ngit push origin main\nP",
+      // 终审 B-1 回归牙：载荷 + 9 跳透明包装 + 真命令（0.7.12 在这里静默放行）
+      `sh <<'SH'\n${'sudo '.repeat(9)}rm -rf /tmp/build\nSH`,
+      `ssh host <<'SH'\n${'command '.repeat(9)}rm -rf /tmp/build\nSH`,
+      // 终审 B-2：执行型载荷 + 内容规则不覆盖的 `dd` ⇒ 必须由形状判据抓
+      `sh <<'SH'\n${'sudo '.repeat(9)}dd if=/dev/zero of=/dev/disk2\nSH`,
+      // 三层 `sh -c` 包着真命令写在载荷里
+      "sh <<'SH'\nsh -c 'sh -c \"rm -rf /tmp/build\"'\nSH",
+    ]
+    for (const [i, command] of shapes.entries()) {
+      const p = h.permissionHandler(bashReq(`tc-v13-${i}`, command, ['/tmp/build']))
+      await flush()
+      assert.equal(h.pendingEvents().length, i + 2, `${command.slice(0, 34)}… 必须再弹一次（第 ${i + 1} 条）`)
+      assert.equal(h.logs.filter((l) => l.includes('命中会话期工具名授权')).length, 0, '不得走免弹通道')
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[i + 1].permId, answer: 'deny' })
+      assert.equal(await p, 'deny', '必须仍由用户裁决')
+    }
+    assert.equal(h.logs.filter((l) => l.includes('危险命令门命中')).length, shapes.length,
+      `${shapes.length} 条都必须留下归因日志（不得为零）`)
+    // 归因必须给出内容规则（不是形状规则）：最后三条是 B-1 的回归牙
+    assert.ok(h.logs.some((l) => l.includes('rm -rf')), '留痕里应能看到内容规则名')
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/proj'), true,
+      '危险命令被拒不得撤销既有的工具名授权')
+
+    // 阴性对照：**普通正文**的 heredoc（无危险字样、无形状可疑）⇒ 照旧走工具名短路免弹
+    const safe = h.permissionHandler(bashReq(
+      'tc-v13-safe',
+      "git add -A\ngit commit -q -F - <<'EOF'\n- planGrantWrites 新增 none 出口：用户给了非空路径但全部被丢弃 ⇒\nEOF",
+      ['/tmp/build'],
+    ))
+    await flush()
+    assert.equal(h.pendingEvents().length, shapes.length + 1, '阴性对照不得新增弹球（普通正文不判）')
+    assert.equal(await safe, 'allow', '普通正文 ⇒ 照旧命中工具名授权免弹')
+
+    // 代价（C 组，如实登记）：载荷正文里**真的写出**危险命令字样 ⇒ 必须再弹一次
+    const cost = h.permissionHandler(bashReq(
+      'tc-v13-cost',
+      "git commit -q -F - <<'EOF'\nfix: note\ngit push 这类命令写在正文里时也只是在描述\nEOF",
+      ['/tmp/build'],
+    ))
+    await flush()
+    assert.equal(h.pendingEvents().length, shapes.length + 2, '载荷正文提到危险命令字样 ⇒ 多弹一次')
+    assert.equal(h.logs.filter((l) => l.includes('危险命令门命中')).length, shapes.length + 1)
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[shapes.length + 1].permId, answer: 'deny' })
+    assert.equal(await cost, 'deny')
+  })
+  // v0.7.14：**判定前的文本归一化（续行拼接 / 换行转义折空格 / 折叠空白）** 的端到端证据。
+  //
+  // 现场：先正常授权 `qoder:bash`，随后一条**跨行**命令 —— `git \` ⏎ `push origin main`
+  // （shell 续行）或 `sh -c "true` ⏎ `rm -rf …"`（`-c` 正文里的换行）。改前这两类判 `null`
+  // ⇒ 命中会话级工具名授权 ⇒ **零弹框零留痕放行**（真机上它们都真的会执行）。
+  // 本用例钉住：这类帧必须再弹一次（不得 allow），归因日志 ≥1、免弹日志 0。
+  it('E2E：续行 / 多行 `-c` 实参 ⇒ 已授权 qoder:bash 也必须再弹一次（不得静默放行）', async () => {
+    const { h, rules } = await granted()
+    const nl = '\n'
+    const shapes = [
+      [`git \\${nl}push origin main`, 'git push'],
+      [`rm \\${nl}-rf /tmp/build`, 'rm -rf'],
+      [`npm \\${nl}publish --tag next`, 'npm publish'],
+      [`sh -c "true${nl}rm -rf /tmp/build"`, 'rm -rf'],
+      [`bash -c "echo hi${nl}git push origin main"`, 'git push'],
+      [`pwsh -Command "x${nl}npm publish"`, 'npm publish'],
+      ['rm  -rf /tmp/build', 'rm -rf'], // 空白规避（多空格）
+      [`git${'\t'}push origin main`, 'git push'], // 空白规避（TAB）
+    ]
+    for (const [i, [command, rule]] of shapes.entries()) {
+      const p = h.permissionHandler(bashReq(`tc-v14-${i}`, command, ['/tmp/build']))
+      await flush()
+      assert.equal(h.pendingEvents().length, i + 2, `${JSON.stringify(command)} 必须再弹一次（第 ${i + 1} 条）`)
+      assert.equal(h.logs.filter((l) => l.includes('命中会话期工具名授权')).length, 0, '不得走免弹通道')
+      h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[i + 1].permId, answer: 'deny' })
+      assert.equal(await p, 'deny', '必须仍由用户裁决')
+      assert.match(h.logs.join('\n'), new RegExp(`危险命令门命中.*${rule.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+        `留痕里应能看到归因 ${rule}（第 ${i + 1} 条）`)
+    }
+    assert.ok(h.logs.filter((l) => l.includes('危险命令门命中')).length >= shapes.length,
+      `${shapes.length} 条都必须留下归因日志（不得为零）`)
+    assert.equal(rules.toolGrantCovers('parent-1', 'qoder', 'bash', '/proj'), true,
+      '危险命令被拒不得撤销既有的工具名授权')
+
+    // 阴性对照：多行但**每行都是普通命令/普通文本** ⇒ 照旧命中工具名授权免弹
+    const safe = h.permissionHandler(bashReq(
+      'tc-v14-safe',
+      `echo hi${nl}ls -la /tmp${nl}git commit -q -F - <<'EOF'${nl}- planGrantWrites 新增 none 出口${nl}EOF`,
+      ['/tmp/build'],
+    ))
+    await flush()
+    assert.equal(h.pendingEvents().length, shapes.length + 1, '阴性对照不得新增弹球')
+    assert.equal(await safe, 'allow', '普通多行命令 ⇒ 照旧命中工具名授权免弹')
   })
 })
 

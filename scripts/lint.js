@@ -19,6 +19,7 @@ function walk(dir) {
 
 walk(join(root, 'lib'))
 walk(join(root, 'test'))
+walk(join(root, 'scripts')) // 终审 Minor-5：本脚本自己也归 `node --check`（首行注释就是 "every module"）
 
 for (const file of files) {
   execFileSync(process.execPath, ['--check', file], { stdio: 'inherit' })

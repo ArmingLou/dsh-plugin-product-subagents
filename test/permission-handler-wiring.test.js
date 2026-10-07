@@ -57,6 +57,8 @@ const PH_PARAMS = [
   // v0.7.9 缺口A/B/D 修正：写入档位判定点、弹框预填目录、正文推测目录（推测预填档）、
   // 决策附带目录的取用
   'planGrantWrites', 'suggestedDirs', 'inferredDirs', 'scanPathsLoose', 'takeDecisionPaths',
+  // v0.7.17：绑定记录缺 cwd/parentSessionId 时回退持久 registry
+  'registry',
 ]
 
 /**
@@ -74,6 +76,7 @@ const PH_PARAMS = [
  *   默认 `[]`，v0.7.9 用来测磁盘规则与老文件兼容——只给内存数组，不碰真实 ~/.dsh）
  * @param {(paths:string[])=>string[]} [host.expand] 会话规则写入侧的路径展开器
  *   （默认恒等；传生产 `expandPathsWithParents` 才能验证"文件路径落父目录"）
+ * @param {object} [host.registry] 持久 registry 替身（默认 get() 返回 undefined）
  * @param {(toolCall:object)=>string[]} [host.scanPathsLoose] 正文文本扫描替身
  *   （默认生产实现；注入 `() => { throw new Error() }` 可验证推测档失败不拖垮弹窗）
  */
@@ -141,6 +144,7 @@ function harness(host = {}) {
     inferredDirs,
     host.scanPathsLoose || scanPathsLoose,
     takeDecisionPaths,
+    host.registry || { get: () => undefined },
   )
   // 真实决策入口：apply() 里注册的那个回调（含"未知 permId 忽略"分支）
   const onDecision = new Function(

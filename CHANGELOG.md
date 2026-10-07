@@ -1,3 +1,57 @@
+## [0.7.17] — 2026-10-07
+
+**修一处静默失效：子代理被空闲回收后的「冷恢复」重建 binding 记录时丢了 `cwd` 与 `parentSessionId`，
+导致 ACP 权限判定的规则来源被整体跳过 —— 连 `allowlist.json` 都没被读，此后每条请求都转人工。**
+危险门、5 条命令名单、全文危险词层、落盘白名单的读侧语义、`allow-once` 语义**一字未动**（本版只补齐记录字段）。
+
+> 用户报的现象：「另一个工作区（suansuan）还是有弹出授权黄球，没有自动授权通过，为什么？
+> 配置已经有 paths 了……都符合白名单里面的规则啊」。
+
+### 现场（为什么必须改）
+
+同一台机器、同一个工作区、同一份 `allowlist.json`，行为**恰好在"空闲回收 → 重连"边界翻转**：
+
+| 时刻 | 事实 |
+|---|---|
+| 14:22–14:41（qoder 进程 #1） | 6 次权限询问全部 `duration_ms` = 13/14/18/16/20/21（**毫秒级 = 机器代答，正在自动放行**） |
+| `14:49:17` | 日志逐字 `process.exiting exit_code=143 reason="signal_term"` = 本插件空闲回收（`lib/index.js` 的 `scheduleDispose` → `bridge.dispose()` + `bindings.delete(childId)`） |
+| 15:18:49（进程 #2，`SessionStart:resume`） | 走**冷恢复** `bridge.reconnect()` 重建记录 |
+| 15:19:41 / 15:21:52 | 询问耗时变成 **87241 ms（人工点球）** / 挂起 |
+
+离线复刻（同一真实帧、只换 binding 记录）：热记录 ⇒ `tier:disk` 自动放行、`readUserAllowlist()` 调 1 次；
+冷记录 ⇒ 弹 pending、`readUserAllowlist()` 调 **0 次**，且 emit 载荷与现场那条挂起请求**逐字段一致**。
+
+### Fixed
+
+- **`lib/tools/product-submit.js`（根因）**：冷恢复分支重建记录时补齐 `cwd` 与 `parentSessionId`
+  （取值优先级：**registry 持久值 > 会话头 `agent.session.header` > 本次恢复用的 cwd**）。
+  判据侧 `lib/index.js` 的两道作用域守卫（`if (!danger && bindParentSessionId)` / `if (!danger && bindCwd)`）
+  原本因字段为 `null` 而整体不成立 ⇒ `ruleSources = []` ⇒ `evaluateRuleSources([]) = {allowed:false}` ⇒
+  每条 ACP 权限请求都转人工。补齐后落盘档 / 工作区域档 / 会话档恢复正常求值。
+- **`lib/index.js` `persistRemote`**：把 `parentSessionId` 一起落 registry（原先只落 `{product, remoteId, cwd}`），
+  使「本会话允许」这类**会话档**能跨空闲回收与进程重启存活。
+- **`lib/index.js`（加固，非放开）**：绑定反查时记录缺字段则回退 `registry.get(childId)` —— 回退值与绑定值同源
+  （同一 child 的持久条目），不改变 cwd 作用域，只是防止同类"静默失效"再次发生。
+- **副作用**：`appendUserRule` 要求非空 `cwd`（`lib/user-allowlist.js`）；冷恢复丢 `cwd` 时用户点
+  「总是允许（项目内）」**也写不进盘**。本版一并修复。
+
+### Tests
+
+- 新增 `test/permission-cold-recovery.test.js`（7 用例）：记录必含 `cwd`/`parentSessionId`（含回退链两例）、
+  `persistRemote` 必落 `parentSessionId`、冷恢复记录 + 执行类帧 + 命中落盘规则 ⇒ **`allow`、不发
+  `permission-pending`、`readUserAllowlist()` 被调用**、**反向钉子**（记录无 `cwd` 且 registry 无值时仍须询问，
+  且**不得**读落盘白名单 —— 禁止用"无条件读盘"绕过 cwd 作用域）、回退命中、`cwd` 空时拒绝写盘。
+- `test/permission-handler-wiring.test.js` 同步新增自由变量 `registry` 注入（默认 `{get:()=>undefined}`，既有用例行为不变）。
+- 读数：改前 `# tests 587 / # pass 587 / # fail 0`、`lint ok: 57 files`；改后 **`# tests 594 / # pass 594 / # fail 0`**、**`lint ok: 58 files`**。
+  先红后绿：最终测试文件跑在未改 lib 上 ⇒ `7 tests / 2 pass / 5 fail`。
+  变异：还原记录字段 ⇒ 3 红；去掉 `bindCwd` 守卫 ⇒ 反向钉子 T4 红；去掉 registry 回退 ⇒ 红；`persistRemote` 不落 `parentSessionId` ⇒ 红。
+
+### 已知边界（仍会询问，属设计）
+
+请求路径不被任何规则覆盖；危险门命中；`reqPaths` 为空的无路径请求（如联网搜索）。
+另：**本补丁前已存在**的 registry 老条目没有 `parentSessionId`，其「本会话允许」跨回收是否恢复取决于运行时会话头是否可读
+（`cwd` 在老条目里已有 ⇒ 落盘档 / 工作区域档不受影响）。
+
 ## [0.7.16] — 2026-10-07
 
 **纯加法：危险门命中的 ASK 在 `permission-pending` 载荷里带上「为什么问」的归因与命令正文。**

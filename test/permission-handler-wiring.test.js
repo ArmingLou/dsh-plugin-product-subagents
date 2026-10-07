@@ -3068,3 +3068,104 @@ describe('v0.7.10 授权不变式（六条 + 终审 M-1 边界）', () => {
     assert.match(String(h.resolvedEvents()[1].grantReason), /仅放行本次/)
   })
 })
+
+// ── v0.7.16（用户裁定）：高危 ASK 的 pending 载荷必须带"为什么问"的归因 ─────────────
+//
+// 现场缺陷：兄弟仓（dsh-agent-dispatch）的授权球拿不到归因，只能照普通询问渲染——
+// 于是在危险命令的弹框上照样给出「本会话总是允许该工具 / 总是允许(项目)」，还写着
+// 「（本会话将记住：qoder:bash）」。那句话是**错误承诺**：危险门与档位无关，同一条
+// 命令下次照样弹（这是用户早先亲自定的契约，本轮不动）。更糟的是用户点了就会真写出
+// 一条永远用不上的规则（现场 dispatches.jsonl：15:30:46 danger-command-block 紧接
+// 15:31:31 rule-tool-disk）。
+// ⇒ 兄弟仓要按归因渲染专用弹框（只留「允许一次」「拒绝」+ 显示命令原文），而归因
+//   只有本产品侧知道 ⇒ 本仓必须把 askReason/dangerRule/dangerSegment/dangerCommand
+//   随 permission-pending 透出。**只有危险门导致的 ASK 才带**；其它原因的 ASK 载荷
+//   一字不变。判定逻辑（谁放行、谁询问）本轮零改动，下面的用例同时钉住这一点。
+describe('v0.7.16 高危归因字段：危险 ASK 带、非危险 ASK 不带（判定零变更）', () => {
+  const bashReq = (toolCallId, command, paths = []) => ({
+    product: 'qoder', sessionId: 'acp-1',
+    description: 'Allow bash?',
+    toolCall: {
+      _meta: { qoder: { toolName: 'Bash' } },
+      kind: 'execute',
+      content: [{ content: { text: command }, type: 'content' }],
+      rawInput: { command, description: 'x' },
+      status: 'pending',
+      title: command,
+      toolCallId,
+    },
+    paths,
+  })
+
+  it('危险门 ASK ⇒ 载荷带 askReason=danger + dangerRule + dangerSegment + dangerCommand', async () => {
+    const h = harness({ bindings: bound() })
+    h.permissionHandler(bashReq('tc-a1', 'rm -rf /tmp/build', ['/tmp/build']))
+    await flush()
+    const [pending] = h.pendingEvents()
+    assert.equal(pending.askReason, 'danger', '必须显式归因到危险门')
+    assert.equal(pending.dangerRule, 'rm -rf', '命中的规则名要能显示')
+    assert.equal(pending.dangerSegment, 'rm -rf /tmp/build', '命中的那段命令原样透出')
+    assert.equal(pending.dangerCommand, 'rm -rf /tmp/build', '命令正文原样透出')
+    assert.equal(pending.dangerCommandOmitted, 0, '没截断时省略数必须是 0')
+  })
+
+  it('硬要求：危险命令在**尾部**时，片段与整条正文都要完整可见（不是截到 160/200 就完）', async () => {
+    const cmd = 'cd /x && echo "' + '一大段说明文字'.repeat(30) + '" && grep -R "needle" . && rm -rf /tmp/a'
+    const h = harness({ bindings: bound() })
+    h.permissionHandler(bashReq('tc-a2', cmd, []))
+    await flush()
+    const [pending] = h.pendingEvents()
+    assert.equal(pending.dangerSegment, 'rm -rf /tmp/a', '尾部命中单独成段透出，兄弟仓据此展示')
+    assert.equal(pending.dangerCommand, cmd, '整条正文原样透出，兄弟仓才能给出完整命令')
+    assert.ok(pending.dangerCommand.length > 160, `本用例的正文必须长过旧渲染的 160 字符截断点，实际 ${pending.dangerCommand.length}`)
+    assert.ok(pending.dangerCommand.indexOf(pending.dangerSegment) > 160,
+      '命中片段必须落在旧截断点**之后**——否则这条用例钉不住那个缺陷')
+  })
+
+  it('非危险 ASK ⇒ 载荷**不带**这些字段（不新增语义，老消费方看到的形状不变）', async () => {
+    const h = harness({ bindings: bound() })
+    h.permissionHandler(bashReq('tc-a3', 'ls -la /etc/hosts', ['/etc/hosts']))
+    await flush()
+    const [pending] = h.pendingEvents()
+    assert.equal(h.pendingEvents().length, 1, '前置条件：这条确实进了交互询问')
+    for (const key of ['askReason', 'dangerRule', 'dangerSegment', 'dangerCommand', 'dangerCommandOmitted']) {
+      assert.equal(key in pending, false, `非危险 ASK 不得带归因字段 ${key}`)
+    }
+    // 既有字段一个都不能少（归因是加法，不是替换）
+    for (const key of ['childId', 'permId', 'product', 'description', 'paths', 'suggestedDirs', 'inferredDirs', 'category', 'toolName', 'toolNameSource', 'rawToolName', 'cwd', 'parentSessionId', 'remoteSessionId', 'at']) {
+      assert.ok(key in pending, `老载荷键 ${key} 不得消失`)
+    }
+  })
+
+  it('判定零变更：危险 ⇒ 必弹、allow-once 不放行任何记忆档；同会话的安全命令照旧免弹', async () => {
+    const rules = createSessionRules({ expand: (p) => (Array.isArray(p) ? p : []) })
+    const h = harness({ bindings: bound(), rules })
+    const p1 = h.permissionHandler(bashReq('tc-a4a', 'ls -la /Users/x', ['/Users/x']))
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session' })
+    assert.equal(await p1, 'allow')
+    const p2 = h.permissionHandler(bashReq('tc-a4b', 'git push origin main', []))
+    await flush()
+    assert.equal(h.pendingEvents().length, 2, '已授权 bash 后 git push 仍必须弹（契约不变）')
+    assert.equal(h.pendingEvents()[1].askReason, 'danger')
+    const before = { tool: rules.toolGrantSize('parent-1'), path: rules.size('parent-1') }
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'allow-once' })
+    assert.equal(await p2, 'allow')
+    assert.deepEqual({ tool: rules.toolGrantSize('parent-1'), path: rules.size('parent-1') }, before,
+      '高危弹框只给「允许一次」⇒ allow-once 不得新增任何记忆档')
+    const p3 = h.permissionHandler(bashReq('tc-a4c', 'ls -la /Users/y', ['/Users/y']))
+    assert.equal(await p3, 'allow', '会话级工具名授权仍然生效（判定没被动过）')
+  })
+
+  it('降级如实：注入"门判得出规则名但没带正文"的替身 ⇒ 载荷仍是 askReason+dangerRule（兄弟仓仍能判高危）', async () => {
+    const h = harness({ bindings: bound(), dangerousExecuteMatch: () => ({ rule: 'rm -rf', segment: 'rm -rf /tmp/z', source: 'rawInput.command' }) })
+    h.permissionHandler(bashReq('tc-a5', 'rm -rf /tmp/z', []))
+    await flush()
+    const [pending] = h.pendingEvents()
+    assert.equal(pending.askReason, 'danger')
+    assert.equal(pending.dangerRule, 'rm -rf')
+    assert.equal(pending.dangerSegment, 'rm -rf /tmp/z')
+    assert.equal(pending.dangerCommand, '', '拿不到正文时给空串而不是 undefined，REST 侧才不会漏键')
+  })
+
+})

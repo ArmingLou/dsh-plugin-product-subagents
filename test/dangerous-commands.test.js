@@ -11,7 +11,7 @@ import fs, { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from '
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { DEFAULT_DANGER_PATTERNS, MAX_ATTRIBUTION_TOKENS, MAX_DANGER_CONFIG_BYTES, MAX_DANGER_PATTERNS, MAX_DANGER_PATTERN_CHARS, MAX_DANGER_TEXT_CHARS, MAX_HEREDOC_OPS, dangerPatternsPath, dangerousCommandMatch, dangerousExecuteMatch, foldCase, heredocTerminatorLines, normalizeCommandText, readDangerPatterns, resetDangerPatternsCache, scanDangerPatterns, splitSubCommands, valueOptionsOf } from '../lib/dangerous-commands.js'
+import { DEFAULT_DANGER_PATTERNS, MAX_ATTRIBUTION_TOKENS, MAX_DANGER_COMMAND_CHARS, MAX_DANGER_CONFIG_BYTES, MAX_DANGER_PATTERNS, MAX_DANGER_PATTERN_CHARS, MAX_DANGER_TEXT_CHARS, MAX_HEREDOC_OPS, dangerPatternsPath, dangerousCommandMatch, dangerousExecuteMatch, foldCase, heredocTerminatorLines, normalizeCommandText, readDangerPatterns, resetDangerPatternsCache, scanDangerPatterns, splitSubCommands, valueOptionsOf } from '../lib/dangerous-commands.js'
 // v0.7.9（复审 M-2 / 第三轮复审 B-1）：门与路径侧的口径关系要能对着 acp.js 的路径兜底
 // 断言（**刻意的不对称**：门宁可多问、路径宁可少授权），故直接引它
 import { extractPaths, scanExecuteCommandPaths } from '../lib/bridges/acp.js'
@@ -81,6 +81,53 @@ describe('v0.7.9 危险命令门：三类模式必须命中', () => {
     assert.equal(dangerousExecuteMatch(exec('NPM PUBLISH')).rule, 'npm publish')
     const hit = dangerousExecuteMatch(exec('cd /TMP && RM -Rf ./Build'))
     assert.equal(hit.segment, 'RM -Rf ./Build', 'segment 必须是原文大小写，不得被归一化污染')
+  })
+})
+
+// ── v0.7.16（用户裁定）：高危弹框要显示"相关命令的操作内容" ──────────────────────
+//
+// 用户上一轮的误判现场：授权球只给了被截断的说明文字，`rm -rf` 在命令尾部时用户
+// 根本看不见，于是把高危请求当成普通请求点了允许。判定归判定，**归因必须能把整条
+// 命令原样交给 UI**——所以命中信息里除了 rule/segment，还要带上被判定的那份正文。
+// 这一节的字段只用于展示，不参与任何判定（判定逻辑与本文件的既有断言一字不变）。
+
+describe('v0.7.16 归因透出：命中信息带命令正文（供授权弹框原样展示）', () => {
+  it('command = 被判定的那份正文**原文**（含未命中的前半段，不折叠空白）', () => {
+    const raw = 'cd /x   &&   echo "说明"   &&   rm -rf /tmp/a'
+    const hit = dangerousExecuteMatch(exec(raw))
+    assert.equal(hit.command, raw, '必须逐字原样，不得归一化/裁剪前半段')
+    assert.ok(hit.command.includes('rm -rf /tmp/a'), '尾部命中必须落在这份正文里')
+    assert.equal(hit.segment, 'rm -rf /tmp/a')
+  })
+
+  it('正文来源与 command 一致（title / content 兜底来源同理）', () => {
+    const viaTitle = dangerousExecuteMatch({ kind: 'execute', title: 'git push origin main' })
+    assert.equal(viaTitle.source, 'title')
+    assert.equal(viaTitle.command, 'git push origin main')
+  })
+
+  it(`超长正文按展示上限截断，并如实给出省略字符数（不是静默截断）`, () => {
+    const huge = 'echo hi && rm -rf /tmp/a && ' + 'x'.repeat(MAX_DANGER_COMMAND_CHARS * 2)
+    const hit = dangerousExecuteMatch(exec(huge))
+    assert.equal(hit.command.length, MAX_DANGER_COMMAND_CHARS)
+    assert.equal(hit.commandOmitted, huge.length - MAX_DANGER_COMMAND_CHARS)
+    const short = dangerousExecuteMatch(exec('rm -rf /tmp/a'))
+    assert.equal(short.commandOmitted, 0, '没截断时省略数必须是 0，UI 据此决定要不要提示')
+  })
+
+  it('新增字段是**加法**：既有 rule/segment/source 的取值一字不变', () => {
+    const hit = dangerousExecuteMatch(exec('echo hi; rm -rf /tmp/build'))
+    assert.deepEqual({ rule: hit.rule, segment: hit.segment, source: hit.source }, {
+      rule: 'rm -rf', segment: 'rm -rf /tmp/build', source: 'rawInput.command',
+    })
+    assert.deepEqual({ rule: hit.rule, segment: hit.segment, source: hit.source, command: hit.command, commandOmitted: hit.commandOmitted }, {
+      rule: 'rm -rf', segment: 'rm -rf /tmp/build', source: 'rawInput.command', command: 'echo hi; rm -rf /tmp/build', commandOmitted: 0,
+    })
+  })
+
+  it('没有命中 ⇒ 仍是 null（不得因为多带了展示字段就判出东西来）', () => {
+    assert.equal(dangerousExecuteMatch(exec('ls -la /tmp')), null)
+    assert.equal(dangerousExecuteMatch(null), null)
   })
 })
 

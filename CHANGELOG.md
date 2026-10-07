@@ -1,3 +1,53 @@
+## [0.7.16] — 2026-10-07
+
+**纯加法：危险门命中的 ASK 在 `permission-pending` 载荷里带上「为什么问」的归因与命令正文。**
+判定入口、判定顺序、5 条命令名单、全文危险词层、`allow-once` 的语义**一字未动**。
+
+> 用户原话：「碰到是高危情况下 的悬浮球弹出，只需要提示 **高危操作权限申请**，这种情况下，
+> 按钮操作 只需要提供 **允许一次** 和 **拒绝**。」追加硬要求：「需要保留**相关命令的操作内容**」。
+> 兄弟仓 `dsh-agent-dispatch` 同批发 **1.12.15**，据此渲染专用弹框。
+
+### Added —— 归因透出（只加字段，不参与任何判定）
+
+| 字段 | 出现条件 | 内容 |
+|---|---|---|
+| `askReason` | **仅**危险门命中的 ASK | 固定 `'danger'`（其它原因的 ASK 载荷一字不变，连键都不加） |
+| `dangerRule` | 同上 | 命中规则名（`rm -rf` / `git push` / `npm publish` / `text:*` / `command-too-long` …） |
+| `dangerSegment` | 同上 | **命中的那段片段原文**（不 trim、不折叠空白） |
+| `dangerCommand` | 同上 | 命令正文原文，截 `MAX_DANGER_COMMAND_CHARS = 20000` |
+| `dangerCommandOmitted` | 同上 | 被省略的字符数（**如实报数**，不静默截断） |
+
+- `lib/dangerous-commands.js:1416-1429`：`dangerousExecuteMatch` 的命中结果加 `command` / `commandOmitted`
+  两个展示字段；`rule` / `segment` / `source` 取值不变，任何判据都不读这两个新键。
+- `lib/dangerous-commands.js:519`：新增 `MAX_DANGER_COMMAND_CHARS = 20000`（**展示**上限，与判定用的
+  `MAX_DANGER_TEXT_CHARS = 256KB` 无关）。为什么要上限：pending 载荷要经事件与 REST 两道转发，
+  几 MB 正文整块塞进授权弹框的 DOM 会把面板冻住。
+- `lib/index.js:461-467`：`permission-pending` emit 里 `...(danger ? {…} : {})`。`danger` 的取值与位置
+  都没动 ⇒ **危险 ASK 必带归因、非危险 ASK 一个键都不多**（两条都有用例钉）。
+
+### 现场缺陷（本版解决的）
+
+旧渲染只给 `description` 的前 160 字符 ⇒ 命中片段落在命令尾部时，用户在球上看不到 `rm -rf`，
+把高危请求当普通请求点了允许；同时黄球照样给出「本会话总是允许该工具 / 总是允许(项目)」并写着
+「（本会话将记住：qoder:bash）」——那是**错误承诺**（危险门与档位无关，写了下次照样问）。
+
+### Tests
+
+- `npm test`：**587 / 587**（577 → 587）；`npm run lint`：**lint ok: 57 files**。
+- 新增 `test/dangerous-commands.test.js:94-133` 5 条（命中信息带正文、省略数如实、上限 20000、
+  正文来源四路径不丢判定）与 `test/permission-handler-wiring.test.js:3084-3172` 5 条
+  （危险 ASK 带归因 / 非危险 ASK 不带 / **尾部命中**用例 / 判定零变更对照 / 上游缺正文时的如实降级）。
+- 反退化：K 组 6/6、M 组 14/14；判定差分语料 **变松 0 / 变严 0 / 归因漂移 0**（与 0.7.15 冻结树逐条对照：
+  40,000 条文本 × `dangerousCommandMatch` + 40,000 × 4 种正文来源 = 160,000 帧 × `dangerousExecuteMatch`，
+  比对的是 `{hit, rule, segment}` 与 `{hit, rule, segment, source}`——新字段 `command / commandOmitted`
+  不参与判定，命中项里 28,298 帧带上了正文）。
+- 变异自证：把 emit 的归因展开改成 `...({})` ⇒ `test/permission-handler-wiring.test.js` **108/112（4 红）**。
+
+### 跨仓
+
+载荷是**加法字段**：旧版 `dsh-agent-dispatch` 忽略未知键 ⇒ 滚动升级不炸。兄弟仓在拿不到归因时
+**保持原渲染**（用户裁定：不在渲染层复制一份危险判定做兜底），所以黄球那一半需要两仓一起上。
+
 ## [0.7.15] — 2026-10-06
 
 **判定模式变更（用户裁定）：在原有「按段 / 形状」判定之上，再加一层**全文危险词判定**，

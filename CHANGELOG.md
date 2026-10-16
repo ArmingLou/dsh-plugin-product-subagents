@@ -1,3 +1,328 @@
+## [0.7.21] — 2026-10-16
+
+**修一处限流判定漏判：qoder 的「排队中」用的是 `queue` + `ing` 形（`Queuing failed`），
+旧 token 一个都不匹配 ⇒ 绕过档内退避重试，一秒都没等就直接上报编排层换档。**
+
+现场（两次真实 ACP 派发，编排层收到的原文，仅 sessionId / request id 不同）：
+
+```
+500: Queuing failed. Try again later or enter /model to switch models. | stderr: Error handling request
+{ jsonrpc: '2.0', id: 5, method: 'session/prompt', params: { sessionId: '83193b62-2006-41e2-97db-8eb5…
+```
+
+0.7.20 确立的排队 token 只认 `queued` / `queueType` / `isQueued`——
+`\bqueue(type|d)\b` 要求字面 `queuetype`/`queued`，而 `Queuing` 是 `queue`+`ing`，
+**不含 `queued`**。实测（`import { isRateLimited }` 后传入真实错误对象，两种形态：
+`Error` 包 `data` 的 ACP `RequestError` 形状、以及裸字符串消息）**全部返回 `false`**。
+判定不命中 ⇒ `submit()` 的限流重试分支（`rateLimitRetries` 默认 3 / `rateLimitBackoffMs`
+默认 60000）被完全绕过，与 0.7.20 修的 `model_queued` 是同族故障、同一条漏网路径。
+
+### 改动
+
+**判定 token 补 `-ing` 词形**（`lib/bridges/acp.js` 的 `QUEUED_OR_LIMITED_RE`）：
+
+1. 新增 `\bqueuing\b` / `\bqueueing\b`（英文两种拼法都覆盖，字边界锚定）。
+2. **保持 0.7.20 的克制口径**：仍**不**匹配裸 `queue` / 裸 `排队`——
+   `queue backlog is now drained`、`tasks are enqueued`、`dequeuing the pending items`
+   这类正常文本会误伤；字边界也保证 `enqueueing` / `dequeuing` 不命中。
+3. **放弃 `try again later`**（明确取舍）：该短语已被 `lib/submit-failure.js` 的
+   `FAILOVER_TEXT` 识别为 failover 文本特征，分级语义已覆盖；纳入限流词表会把**任何**
+   含该短语的错误一票挂进限流族，白等一轮退避，伤害面 > 收益。
+
+### 边界（本次**不动**）
+
+队列族重试**重发原 task**（产品在排队时并未开始干活）；`EMPTY_RESPONSE` 族重试重发的
+是**延续指令**（`DEFAULT_EMPTY_RESPONSE_RETRY_PROMPT`）。两族并存、互不干扰，
+`EMPTY_RESPONSE` 的重试逻辑本次未改。`lib/submit-failure.js` 的分级也未改——
+预算耗尽后抛原错误，仍由 `FAILOVER_CODES` 判换档（这是设计）。
+
+### 测试
+
+`test/rate-limit-queued.test.js` 续加：两次真实原文（`id: 5` / `id: 2`）、
+`Queueing` 双 e 拼法、纯 `-ing` 词形、结构化 `data` 形态；
+防误伤反例（裸 `queue` / `排队` / `队列已清空` / `dequeuing` / `enqueueing` / 裸 `Try again later`）；
+集成级（首次排队 → 二次成功 ⇒ 重试发生、投递原 task、退避 ≥ 配置值、预算耗尽才抛、
+`submit-failed` 事件从未发出）与「排队族 / EMPTY_RESPONSE 族不串」的边界用例。
+
+## [0.7.20] — 2026-10-15
+
+**修一处限流判定盲区：qoder 的「模型排队」（`model_queued` / `RESOURCE_LIMIT` / `10605`）
+完全不被识别为可重试故障，`product_submit` 因此挂起数分钟。**
+
+现场（一次真实 ACP 派发，`product_submit` 挂起约 8 分钟，日志里 `attempt_failed` 出现 9 次）：
+
+```
+code: 'model_queued', httpStatus: 403, status: 'FORBIDDEN',
+data: { code: '10605', subCode: 'RESOURCE_LIMIT' },
+message: '{"isQueued":true,"modelKey":"qfmodel","queueType":"p3",
+          "retryAfterSeconds":30,"serviceAvailable":false}'
+```
+
+旧 `isRateLimited`（`lib/bridges/acp.js`）只认 `429 / rate limit / throttl / quota / 限流 /
+频率限制 / 请求过于频繁`，对上面这套 qoder **自有信号逐个实测全部漏判**。判定不命中 ⇒
+`submit()` 里**现成**的限流重试分支（`rateLimitRetries` 默认 3 / `rateLimitBackoffMs`
+默认 60000）被完全绕过，一次排队直达 `SUBMIT_TIMEOUT`，故障原样抛给编排层判换档。
+
+### 改动
+
+**判定扩为「限流 **或** 模型排队」**（`lib/bridges/acp.js`）：
+
+1. **结构化字段优先**：`error.code === 'RATE_LIMITED'`（原有）；新增
+   `error.data.code === 'model_queued'`、`error.data.subCode === 'RESOURCE_LIMIT'`、
+   `error.data.httpStatus === 403 && error.data.serviceAvailable === false`。
+   ACP `RequestError` 的 `data` 正是承载产品原始错误对象的那一层（SDK
+   `handleResponse` → `new RequestError(code, message, data)`），所以 `10605` /
+   `RESOURCE_LIMIT` 都可达。
+2. **文本 token 兜底**：`collectErrorText()` 把 message / `error.error` / 顶层
+   `code`+`subCode` / `data`（含 `JSON.stringify`）摊平成片段再匹配
+   `model_queued|resource[_\s-]*limit|queue(type|d)|isqueued|\b10605\b`（大小写不敏感）。
+   **刻意不匹配裸 `queue`/`排队`**：`"queue backlog is now drained"`、`"tasks are
+   enqueued"` 这类正常文本会被误伤，宁可多写具体 token。`10605` 加数字边界，避免在
+   `1106050` 里误命中。
+   ⚠️ 这里**不能**直接 `JSON.stringify(error)`：`Error` 的 `message`/`code` 是**非枚举**
+   属性，序列化结果是 `{}` —— 那正是旧实现漏判的同一个坑。
+3. **尊重 `retryAfterSeconds`**（`extractRetryAfterMs`）：退避取
+   `max(rateLimitBackoffMs, retryAfterSeconds*1000)`，即产品给的等待时间只作**下界**。
+   qoder 实测 30s 已被默认 60000 覆盖，此项是纯保险（产品改值或用户把 backoff 调到 1s
+   时才生效），不单独解析也不会有行为差异。
+
+**没有另建机制**：排队与限流在重试语义上同构（都是「现在别发、等一会原样重发」，
+且产品**未开始执行**），而 `submit()` 的限流路径恰好就是这个语义（熔断冷却 → 重投
+**原 task**）。新建一套只会多一条没人测的并行路径。差别只在退避下界的来源，已按
+第 3 点处理。`reportRateLimited` 复用同一熔断器还有个附带好处：同一产品的**并发**
+会话在冷却期内一起排队，而不是各自撞一次配额。
+
+### 测试有牙（变异验证）
+
+新增 `test/rate-limit-queued.test.js`（29 例）：
+
+- **单元级**：任务书逐个实测过的 5 个样本（`model_queued` / 排队载荷 JSON /
+  `RESOURCE_LIMIT` / `10605` / `Resource limit reached`）钉死为**必须命中**；
+  9 个反例钉死为**必须不命中**（`invalid api key`、`boom`、含 `queue` 的普通文本、
+  `enqueued`、`1106050`、`serviceAvailable:true`、无关 `subCode`、`null`、裸字符串）；
+  另加 429/rate limit/中文限流的**回归**用例（证明没削弱原有判定）。
+- **集成级**：仿 `test/empty-response-retry.test.js` 的 `makeFakeRemote` 范式，走
+  `submit()` 真实内部循环——首次 `prompt` 抛真实 qoder 错误对象、二次成功，断言
+  ①重试发生（prompt 2 次）②返回正文 ③**不 kill 进程**；并钉死「排队重投的是**原 task**
+  而非延续指令」（产品并未开始干活）、「退避 ≥ retryAfterSeconds」、「预算耗尽才抛」、
+  「`rateLimitRetries: 0` 行为与改造前一致」。
+- **编排层不可见**：`product_submit` 走真桥，断言排队重试成功时
+  `submit-failed` 事件**从未发出**（与 v0.7.18 的空正文重试同一机械证明）。
+- 每个用例用**独立 command 名**：`throttle.js` 的限流器是按 command 共享的模块级
+  Map（`cooldownUntil` / `consecutiveFailures` 会跨用例累积），串了会互相拖慢。
+
+变异验证（改完立刻恢复，md5 前后一致 `36be37fd7ed91cfa01a0be1b5885968b`）：
+
+| 变异 | 转红用例 |
+|---|---|
+| 把正则砍回改造前的 token 集合 | 6 例：「命中：model_queued / 排队载荷 JSON / RESOURCE_LIMIT / 10605 / Resource limit reached / RESOURCE_LIMIT 变体」 |
+| 去掉 `retryAfterSeconds` 下界（`reportRateLimited(command, rateBackoffMs)`） | 1 例：「退避不得短于载荷里的 retryAfterSeconds（下界语义）」 |
+| 把整个 `isRateLimited` 还原成 0.7.20 之前的函数体 | **14 例**：9 条「必须命中」单元用例 + 4 条集成用例（重试发生/重投原 task/退避下界/预算耗尽）+ 1 条编排层用例（`submit-failed` 从未发出）——证明**集成路径**（不只是判定函数）被钉死 |
+
+`scripts/check-host-compat.mjs` **无需同步**（本改造不碰宿主契约面：未新增
+`ctx.subagents.*` 调用、未动 `SubagentCapabilities`、未改工具注册形状），实跑仍绿。
+
+> 用户原话：「任务：修复 dsh-plugin-product-subagents 的**限流/排队检测盲区** —— qoder 的
+> `model_queued`（RESOURCE_LIMIT / 10605）当前完全不被识别为可重试故障，导致 product_submit
+> 挂起数分钟。」
+
+## [0.7.19] — 2026-10-15
+
+**修一处宿主换代契约破损：三条 ACP 档（qodercli / deveco / opencode）全部死在启动前的
+`capabilities` 断言上，一条都起不来。**
+
+宿主 `@deepseek-ai/dsh@0.2.1-alpha.3` 把 `SubagentCapabilities` 换成了恰好 4 个成员
+（`agentOptions` / **`agentPreset`** / **`outputSchema`** / **`depthLimit`**），并移除了
+`persona` / `toolFilter`；而本插件仍广告 `{ agentOptions: false, persona: true, toolFilter: true }`
+—— 缺的三个成员是 `undefined`（falsy），宿主 `assertCapabilities` 逐条检查「请求里带了这个字段、
+provider 却没声明该能力 ⇒ 抛 `UNSUPPORTED_CAPABILITY`」，于是编排层每轮必传的 `maxDepth`
+一撞即死。断言发生在 `startActivation` 内、`prepareContinuable` **之前**，所以
+v0.7.18 刚做完并已验证的「EMPTY_RESPONSE 桥内重试」**一次都触发不到**：桥的 `submit()`
+根本没被调用过。
+
+**`depthLimit` 判定为 `true`（而非「字面诚实的 false」）**，因为 maxDepth 的约束落在**宿主**
+身上：本插件注册了 `prepareContinuable` ⇒ `startActivation` 必走 `manager.startLocal` ⇒
+那里执行 `resolveChildDepth(parent, request.maxDepth)`，越界抛 `SubagentDepthError`（在任何远端
+产品会话建立之前）。广告 false 不增加任何安全性，只会让 ACP 档在调用方传 `maxDepth` 时永久不可达
+—— 那正是本次故障。
+
+> 用户原话：「任务：修复 `dsh-plugin-product-subagents` 的 **宿主换代契约破损**——所有 ACP 档因
+> `depthLimit` capability 断言失败而**完全无法启动**。……这是同一轮宿主升级
+> （`@deepseek-ai/dsh@0.2.1-alpha.3`）造成的**第三处**破坏，前两处已修」。
+
+### 现场（为什么必须改）
+
+`dispatches.jsonl` 逐档记录（同一时刻、同一 agent、同一条 routes 链）：
+
+```
+2026-10-15T13:34:53.565Z | qodercli | ok=false | subagent provider "qodercli" does not support the "depthLimit" capability
+2026-10-15T13:34:53.566Z | deveco   | ok=false | subagent provider "deveco"   does not support the "depthLimit" capability
+2026-10-15T13:34:53.566Z | opencode | ok=false | subagent provider "opencode" does not support the "depthLimit" capability
+2026-10-15T13:34:53.671Z | workbuddy| ok=true  |
+```
+
+三条 ACP 档全灭、只有 LLM 档存活 —— 因为失败与产品本身毫无关系，只与**广告的字段**有关。
+逐条证据（`@deepseek-ai/dsh-subagent`）：
+
+| 环节 | 位置 | 事实 |
+|---|---|---|
+| 新契约 | `lib/types/types.d.ts:115-121` | `SubagentCapabilities` = `agentOptions` / `agentPreset` / `outputSchema` / `depthLimit` |
+| 旧契约 | 本仓 `node_modules/@deepseek-ai/dsh-subagent`（0.1.0-rc.6）`lib/types/types.d.ts:78-83` | `outputSchema` / `depthLimit` / `toolFilter` / `persona`（无 `agentOptions`） |
+| 广告 | `lib/index.js:890`（改前） | `{ agentOptions: false, persona: true, toolFilter: true }`：新契约缺 3 个、多 2 个已移除的 |
+| 断言 | 宿主 `lib/index.js:3311-3327`（`startActivation` 内调用） | `{ when: request.maxDepth !== undefined, cap: 'depthLimit' }`，`when && !capabilities[cap]` ⇒ throw |
+| 触发者 | `dsh-agent-dispatch` `lib/dispatch.js:1146` | 无条件 `maxDepth: Math.max(2, callerDepth + 1)` |
+
+**注意 `persona` / `toolFilter` 本来就已经「错」了两代**：`outputSchema` / `depthLimit` 在
+0.1.x 契约里同样存在，本插件从未声明过 —— 只是当时没有调用方传 `maxDepth`，断言从未被触发。
+本次不是「新字段没跟上」，而是**广告面从未被任何护栏校验过**。
+
+### Fixed
+
+- **`lib/host-compat.js`（根因，新导出 `PROVIDER_CAPABILITIES`）**：把广告从注册点内联字面量
+  提成**共享冻结常量**，逐成员注明取值依据与契约出处：
+  - `agentOptions: false` —— 语义**一字未动**（宿主级 model/effort 覆盖无法作用于外部产品 CLI；
+    诚实 false 让请求 fail loud 而不是被静默丢弃）；
+  - `agentPreset: false` —— 本插件从不读 `request.agentPreset`（`lib/` 0 命中），无 preset 可选；
+  - `outputSchema: false` —— 本插件从不读 `request.outputSchema`（工具用 `defineTool` 固定 schema）；
+  - `depthLimit: true` —— 约束由宿主在 `manager.startLocal` 路径上强制执行（见上）；
+  - `persona` / `toolFilter: true` —— **保留**：0.1.x 宿主仍会断言这两个成员，留着不回退旧宿主；
+    注释已标明 0.2.1-alpha.3 起宿主既不声明也不读它们。
+- **`lib/index.js`**：注册点改为 `capabilities: PROVIDER_CAPABILITIES`（导入共享常量），并在原处
+  保留/续写「为什么必须是完整契约」的行内注释。
+- **`lib/tools/product-delegate.js`（同轮升级的第二处，本次一并修）**：`background=true` 路径原本
+  直连 `ctx.subagents.startContinuable` —— 该名在 0.2.1-alpha.3 宿主里 **0 命中**，调用抛
+  `startContinuable is not a function`，即 `product_delegate` 的后台路径整体失效（与
+  `dsh-agent-dispatch` v1.12.17 修的是同一处改名）。改为软兼容：优先
+  `startActivation?.bind(...)`（并补上新版必填的 `delivery: 'parent'`），回退旧名 `startContinuable`
+  且**不带** `delivery`（旧宿主没有这个字段），两端皆无则 loud throw。
+
+### `depthLimit: true` 的依据（安全判断，不是随手填）
+
+- 托管路径站得住：插件注册 `prepareContinuable` ⇒ 宿主 `lib/index.js:3053`
+  `provider.prepareContinuable === void 0 ? manager.startExternal(spec) : manager.startLocal(spec)`
+  ⇒ `startLocal` 的 `assertSubagentMaxDepth` + `resolveChildDepth(parent, request.maxDepth)`
+  （`lib/index.js:1399`、`lib/types/child-agent.js:31-39`）⇒ 越界抛 `SubagentDepthError`。
+- 所以**「声明 true 却没有实际约束」这一安全降级并不成立**：约束是宿主的，且是**前置**的
+  （远端产品会话尚未创建）。插件侧不需要、也不应该再维护第二本深度账。
+- 结论：**不需要改 `dsh-agent-dispatch`**（不改它的 `maxDepth`、也不要求对 ACP 档特殊处理）。
+  若将来把 `depthLimit` 改回 false，必须先让调用方不再传 `maxDepth`，否则 ACP 档再次全灭。
+
+### 护栏（为什么下次能自动抓到）
+
+`scripts/check-host-compat.mjs` 之前**只把缺字段当 warn**，还拿
+`NO_START_CAPABILITIES`（宿主导出的「无能力」样板对象）当唯一真源、用内联字面量的正则去比对，
+于是「缺 3 个成员」被降级成一行提示、「多 2 个遗留成员」只报 subset 违规，真正的致命项没有红。
+现在：
+
+- **第 3 项**：`ctx.subagents.<method>()` 名单改为**从 `lib/**` 调用点抽取**（手写清单正是在
+  0.2.1-alpha.3 改名后漂移的），并带 `startContinuable → startActivation` 别名对与参数个数断言；
+- **第 6 项**：宿主 d.ts 与 `NO_START_CAPABILITIES` **双向核对**后，要求本插件广告**恰好覆盖**
+  契约成员（**缺一即红**，不再是 warn），并反向断言注册点必须用共享常量、不得再出现
+  `capabilities: {` 内联字面量；
+- **第 7 项**：`depthLimit` 不再「信声明」—— 真调宿主导出的 `resolveChildDepth` 验证越界确实抛
+  `SubagentDepthError`、校验插件确实注册了 `prepareContinuable`（决定走哪条路径），并用宿主自己的
+  `SubagentRuntime.prototype.assertCapabilities` 做**实机探针**：带 `maxDepth` 的请求必须通过，
+  而 `agentOptions` / `agentPreset` / `outputSchema` 的请求必须继续被拒（诚实 false 不许被削弱）；
+- **第 8 项**：反向接线断言 —— `product-delegate.js` 必须优先新名、必须带 `delivery: 'parent'`、
+  不得残留直连旧名。
+
+### 遗留（本次核实，未改）
+
+1. **`request.persona` / `request.toolFilter` 已静默失效**：宿主 0.2.1-alpha.3 从
+   `SubagentStartRequest` 移除了这两个字段（源码 0 命中），本插件
+   `lib/tools/product-delegate.js:117` / `:120` 仍在传 —— 对 0.2.1-alpha.3 完全无效
+   （仅对旧宿主有效，故保留未删）。
+2. **权限边界被削弱（重要）**：`toolFilter: { allow: ['product_submit'] }` 原本是**中继子代理的
+   工具白名单**（只留 `product_submit`，`role.allowDelegation` 时加 `product_delegate`），现在不再
+   生效 ⇒ 中继子代理拿到的是**默认工具面**，理论上可自己用本地工具干活。危险门/权限判定/落盘
+   白名单**未受影响**（那是本插件自己的层，且继承父会话权限，无提权），但「只读管道」这一纵深
+   防御已失效。替代方案是 `request.agentPreset`（见 `dsh-agent-dispatch`
+   `docs/agent-preset-migration.md`），本插件尚未实现 preset → 记为待办，不在本版范围。
+3. **`agentOptions: false` 的残余风险**：`dsh-agent-dispatch` 在 agent 路由带 model/effort 时会传
+   `request.agentOptions`，届时 ACP 档会以 `UNSUPPORTED_CAPABILITY("agentOptions")` **loud 失败**
+   （这是该值刻意保留的语义，不是回归）。是否改为 `true`（宿主会把覆盖应用到中继子会话）需要单独
+   决策，本次不动。
+
+### Tests
+
+新增 `test/capabilities-contract.test.js`（14 例，host-free）：广告覆盖新契约 4 成员、每值必须是
+显式 boolean、无契约外多余键、注册点必须用共享常量且不得内联字面量；`maxDepth: 2`（编排层真实
+形状）不再被拒；`depthLimit: true` 的前提（插件注册 `prepareContinuable` + 自己不做深度记账）;
+`agentOptions` / `agentPreset` / `outputSchema` 为 false 时仍 loud 拒绝；`product_delegate` 三条
+分支（新名 + `delivery: 'parent'` / 旧名且不带 `delivery` / 两端皆无 loud throw）。
+
+**测试有牙（变异自证，逐一实测）**：
+
+| 变异 | 单测（新文件） | `check:host` |
+|---|---|---|
+| M1 `depthLimit: true → false` | 2 fail / 12 pass | 2 FAIL |
+| M2 恢复 0.7.18 广告（删 3 成员 + 内联字面量） | 5 fail / 9 pass | 8 FAIL |
+| M3 `product-delegate.js` 退回直连 `startContinuable` | 3 fail / 11 pass | 4 FAIL |
+
+其中 M2 的单测失败项含 `maxDepth: the real dispatch shape (maxDepth: 2) is accepted`，
+报错文本与线上 `dispatches.jsonl` 逐字一致（`does not support the "depthLimit" capability`）；
+M2 的 `check:host` 报 `FAIL: provider capability advertisement is MISSING agentPreset,
+outputSchema, depthLimit` 与 `FAIL: assertCapabilities REJECTS a maxDepth-bearing request for this
+advertisement`。三处变异全部逐字节恢复（`md5` 与变异前基线一致），恢复后全绿。
+
+全量：`npm test` **618 pass / 0 fail**（基线 604 + 14）；`npm run lint` ok（60 files）；
+`npm run check:host` ⇒ `host contract OK on @deepseek-ai/dsh@0.2.1-alpha.3`。
+
+## [0.7.18] — 2026-10-15
+
+**修一处「误换档」：ACP 产品（deveco / opencode / qodercli）返回空正文时，桥内直接抛
+`EMPTY_RESPONSE`，编排层收到即判定该 provider 挂了并换下一档 —— 但这多数只是**附着态偶发**，
+同一会话重试即可恢复。现在改为在**同一会话内**投递「延续指令」重试，默认 3 次，重试对主代理完全不可见。**
+
+`rateLimit` 重试范式、`submit-failure` 的 failover 分级、危险门与权限判定**一字未动**
+（预算耗尽后仍抛原错误、仍由 `submit-failure` 判换档 —— 那是期望行为）。
+
+> 用户原话：「子代理出现过问题。同一个 provider（acp 比如 deveco），遇到 EMPTY_RESPONSE 马上
+> agent_failover，可能是附着态的偶发问题，重试即可，不是 provider 挂了。……屏蔽子代理，特别是
+> acp 比如 deveco 的 EMPTY_RESPONSE，让主代理不可见，子代理内部重试 3 次之后，才真正暴露
+> EMPTY_RESPONSE 给主代理」。
+
+### 现场（为什么必须改）
+
+`lib/bridges/acp.js` 的 `promptWithWatchdog` 在 `Promise.race` 结束后**立刻** `drainText()`，
+文本为空即抛 `EMPTY_RESPONSE`。但 ACP 的 `session/prompt` 响应与文本分片是**两条通道**，
+末片可能还在路上；且 CLI 类产品常**整轮只发工具调用、收尾消息为空**。两种情况下会话都还活着、
+产品仍握着原任务 —— 换档等于白白丢掉整个会话上下文，且新档从零重做。
+
+### Fixed
+
+- **`lib/bridges/acp.js`（根因）**：`submit()` 的重试循环内新增 `EMPTY_RESPONSE` 分支
+  （仿 `rateAttempt` 范式加 `emptyAttempt` 计数器）：
+  - **不 kill、不 reconnect** —— 那会丢掉会话上下文，而上下文正是本方案的全部价值；
+  - 重试前先给 `emptyResponseRetryDelayMs`（默认 500ms）宽限窗口，再 `drainText()` 取一次：
+    若收下迟到的真答案则**直接当成功返回**（省一次产品往返），同时保证下一轮不会把上一轮残留
+    文本与新文本拼接（`drainText` 是**消费式清空**语义）；
+  - 重试投递的是**延续指令**而非原 task：`task` 是标量文本（`promptWithWatchdog` 在 `:1369`
+    自行包装成 `prompt: [{type:'text', text: task}]`），重投原 task 会被产品当成新任务重新下命令
+    ⇒ 重复执行风险高。默认文本见 `DEFAULT_EMPTY_RESPONSE_RETRY_PROMPT`，同时覆盖「没干活」
+    与「干完没汇报」两种真实形态。
+- **`lib/config.js`**：`providerDefSchema` 新增 `emptyResponseRetries`（默认 3，`0` = 关闭，
+  行为与改造前逐字一致）、`emptyResponseRetryDelayMs`（默认 500）、`emptyResponseRetryPrompt`。
+  注意 `emptyResponseRetryDelayMs` **不能**写成 `Number(v) || 500` —— 显式配 `0`（关闭宽限窗口）
+  会被 `||` 吞成 500。
+- **`lib/providers.js`**：`buildProviders` 与 `createBridgeFor` 两处透传上述三个新键。
+
+### 不可见性怎么保证（机械判据）
+
+重试**在本次 `submit()` 内完成**，而编排层可见性分界线是 `lib/tools/product-submit.js:177` 的
+`ctx.emit('product-subagents/submit-failed', ...)`。重试发生在它之前 ⇒ 该事件从不被写入
+⇒ 主代理看不到 `EMPTY_RESPONSE`。仅当预算耗尽才抛原错误，事件恰好发一次。
+
+### Tests
+
+新增 `test/empty-response-retry.test.js`（10 例，含桥级与 `product_submit` 级两条路径）：
+首次空正文二次成功 ⇒ 正常返回**且 `submit-failed` 从未被发出**（不可见性的机械证明）、
+连续 4 次（1+3）⇒ 抛 `code=EMPTY_RESPONSE` 且轮询次数为 4、重试投递的是延续指令而非原 task、
+`emptyResponseRetries: 0` ⇒ 回归保护、宽限窗口内迟到分片直接当成功、
+非 `EMPTY_RESPONSE` 的其他失败不受影响。
+
+全量：`npm test` **604 pass / 0 fail**；`npm run lint` ok（59 files）。
+
 ## [0.7.17] — 2026-10-07
 
 **修一处静默失效：子代理被空闲回收后的「冷恢复」重建 binding 记录时丢了 `cwd` 与 `parentSessionId`，

@@ -47,7 +47,7 @@ function slice(startMarker, closeMarker, label) {
   return src.slice(i, j + closeMarker.length)
 }
 
-const PH_SLICE = slice('const permissionHandler = async ({ product, sessionId, description, paths, toolCall }) => {', '\n  }\n', 'permissionHandler')
+const PH_SLICE = slice('const permissionHandler = async ({ product, providerId, sessionId, description, paths, toolCall }) => {', '\n  }\n', 'permissionHandler')
 const PERSIST_SLICE = slice('const persistRemote = (childId, record, cwd) => {', '\n  }\n', 'persistRemote')
 
 // permissionHandler 的自由变量（apply 闭包作用域）——逐项注入，漏一个就是 ReferenceError。

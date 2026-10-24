@@ -12,9 +12,14 @@
 // 老模型 arguments.command）。因此本文件里三处 0.7.9 早期的断言被改成期望空集，
 // 每处都就地写明了理由；scanPathsLoose 仍被直接调用，只用于"旧实现确实会抓到
 // 正文假路径"的差分证明。
-import { describe, it } from 'node:test'
+import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { extractPaths, extractStructuredPaths, scanPathsLoose } from '../lib/bridges/acp.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { extractPaths, extractStructuredPaths, scanPathsLoose, scanExecuteCommandPaths } from '../lib/bridges/acp.js'
+import { evaluateRuleSources, workspaceRuleOf } from '../lib/permission-rules.js'
+import { expandPathsWithParents } from '../lib/allowlist.js'
 
 /** qoder Edit 载荷形态（实测）：真实目标在 rawInput.file_path，正文在 content[].content.text */
 const qoderEdit = (target, fileContent) => ({
@@ -125,9 +130,20 @@ describe('v0.7.9 C 项：结构化路径优先，正文里的假路径不入请�
     }
     assert.deepEqual(extractPaths(editWithCommand), ['/proj/a.ts'],
       'kind=edit ⇒ 只认结构化 diff path；命令字段与正文都不参与')
+    // v0.7.22【改动的既有断言】旧期望是 []（"既无 kind 也无执行类 name ⇒ 不认定执行类，不扫"）。
+    // 该期望在 codebuddy 实测载荷下固化了缺陷：codebuddy 的权限请求只给
+    // `{toolCallId, rawInput, _meta}`，kind/name/title **三者都不存在**，命令正文在
+    // `rawInput.command` 里（真实报文 `{"command":"ls …/scratch/","description":"…"}`）。
+    // 旧规则使 extractPaths 恒返回空集 ⇒ 授权球目录为空。
+    // 新规则（lib/execute-frame.js:isExecuteFrame 第三判据）：**有 command 就能执行**。
+    // 该放宽只影响"没有 kind 时如何认定"，kind 明确非执行类仍走上面那条一票否决。
     const noKindNoName = { rawInput: { command: 'cat /etc/hosts' } }
-    assert.deepEqual(extractPaths(noKindNoName), [],
-      '既无 kind 也无执行类 name ⇒ 不认定执行类，不扫')
+    assert.deepEqual(extractPaths(noKindNoName), ['/etc/hosts'],
+      '无 kind 但有命令字段 ⇒ 认定执行类帧，扫命令正文（命令里的路径即本次请求客体）')
+    // 反证：没有命令字段的帧仍只认结构化 path，"不扫正文"的既定策略没被拆掉
+    const noCommand = { rawInput: { new_string: 'see /etc/shadow' }, content: [{ type: 'diff', path: '/proj/b.ts', newText: 'x = "/etc/passwd"' }] }
+    assert.deepEqual(extractPaths(noCommand), ['/proj/b.ts'],
+      '无命令字段 ⇒ 只认结构化 path，正文里的路径不入集合')
   })
 
   it('缺口D：Edit 帧的路径集合恰好是 content[] 各 diff 块的 path（多块、去重、保序）', () => {
@@ -776,5 +792,271 @@ describe('v0.7.9 第六轮裁定：信封边界（rawInput/arguments 下数组�
     assert.deepEqual(extractPaths({ locations: [{ path: '/proj/a.txt' }, { file: '/proj/b.txt' }, { uri: 'file:///tmp/c.txt' }] }),
       ['/proj/a.txt', '/proj/b.txt', '/tmp/c.txt'])
     assert.deepEqual(extractPaths({ locations: ['/proj/a.txt'] }), ['/proj/a.txt'])
+  })
+
+  describe('相对路径提取（v0.7.22 codebuddy 修复）', () => {
+    // 夹具必须自建：早期版本把 cwd 写死成作者本机路径，断言依赖磁盘上**恰好**
+    // 存在 scratch/x.txt —— 换一台机器就红（本次接手时该用例正是红的）。
+    let cwd
+    beforeEach(() => {
+      cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-extract-'))
+      fs.mkdirSync(path.join(cwd, 'scratch'))
+      fs.writeFileSync(path.join(cwd, 'scratch', 'existing.txt'), 'x\n')
+      fs.writeFileSync(path.join(cwd, 'notes.txt'), 'x\n')
+      fs.mkdirSync(path.join(cwd, 'build'))
+      fs.writeFileSync(path.join(cwd, 'main'), 'ref\n')
+    })
+    afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }))
+    // v0.7.22【Blocker】：相对路径**必须**落成绝对路径，否则规则层 canonicalPath() 返回
+    // null ⇒ coverage uncovered ⇒ workspace 档 allowed:false ⇒ 照样弹窗。
+    const abs = (p) => path.join(cwd, p)
+
+    it('含路径分隔符 + 存在 → 提取', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'ls -la scratch/' } }, { cwd }),
+        [abs('scratch')]
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat scratch/existing.txt' } }, { cwd }),
+        [abs('scratch/existing.txt')]
+      )
+    })
+
+    it('裸 basename 带扩展名 + 存在 → 提取', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat notes.txt' } }, { cwd }),
+        [abs('notes.txt')]
+      )
+    })
+
+    it('裸 basename 无扩展名 → 不提（即使存在）', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'npm run build' } }, { cwd }),
+        []
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'git checkout main' } }, { cwd }),
+        []
+      )
+    })
+
+    // v0.7.22【补漏】：写目标天然尚不存在 —— 这是"新建文件"的唯一线索，
+    // 存在性校验在这里是错的方向（首版因此把本轮的现场整条漏掉）。
+    it('重定向目标不存在 → 仍提取（新建文件）', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: "printf 'ok' > scratch/new.txt" } }, { cwd }),
+        [abs('scratch/new.txt')]
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'echo hi >> logs/app.log' } }, { cwd }),
+        [abs('logs/app.log')]
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cmd 2> err.txt' } }, { cwd }),
+        [abs('err.txt')]
+      )
+    })
+
+    it('写类命令的目标参数不存在 → 仍提取', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'mkdir -p scratch/newdir' } }, { cwd }),
+        [abs('scratch/newdir')]
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'touch scratch/bare-noext' } }, { cwd }),
+        [abs('scratch/bare-noext')]
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cp a.txt scratch/copy-target.txt' } }, { cwd }),
+        [abs('scratch/copy-target.txt')]
+      )
+    })
+
+    it('非写目标位置的不存在相对路径 → 不提（豁免不能外溢）', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat missing.txt' } }, { cwd }),
+        []
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'git log v1.2' } }, { cwd }),
+        []
+      )
+    })
+
+    // v0.7.22【Minor】：纯版本号不算"带扩展名"，即使 cwd 里真有同名文件。
+    // 旧实现 `\.[A-Za-z0-9]{1,8}$` 会命中 `.2` ⇒ `git log v1.2` 被当路径。
+    it('版本号形态即使存在同名文件也不提取', () => {
+      fs.writeFileSync(path.join(cwd, 'v1.2'), 'tag\n')
+      fs.writeFileSync(path.join(cwd, '2.0.1'), 'tag\n')
+      assert.deepEqual(scanExecuteCommandPaths({ rawInput: { command: 'git log v1.2' } }, { cwd }), [])
+      assert.deepEqual(scanExecuteCommandPaths({ rawInput: { command: 'git checkout v1.2' } }, { cwd }), [])
+      assert.deepEqual(scanExecuteCommandPaths({ rawInput: { command: 'git tag 2.0.1' } }, { cwd }), [])
+      // 反证：非版本号形态仍照常提取
+      assert.deepEqual(scanExecuteCommandPaths({ rawInput: { command: 'cat notes.txt' } }, { cwd }), [abs('notes.txt')])
+    })
+
+    it('无 cwd 时不扫相对路径（退化到只认绝对路径）', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'ls scratch/' } }),
+        []
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat /etc/hosts' } }),
+        ['/etc/hosts']
+      )
+    })
+  })
+
+  // v0.7.22【负向过滤】：伪文件系统不得进 paths。
+  // 风险链：`> /dev/null` ⇒ extractPaths 产出 /dev/null ⇒ suggestedDirs() 取 dirname
+  // ⇒ 弹窗预填 /dev ⇒ 用户点「总是允许」⇒ 落 paths:['/dev'] ⇒ 之后 `> /dev/sda` 自动放行。
+  describe('伪文件系统前缀过滤（/dev /proc /sys /run）', () => {
+    const paths = (command) => scanExecuteCommandPaths({ rawInput: { command } })
+
+    it('重定向到 /dev/null → 不产出 /dev/null，其余路径照常', () => {
+      assert.deepEqual(paths('cat /etc/hosts > /dev/null'), ['/etc/hosts'])
+      assert.deepEqual(paths('npm test 2> /dev/null'), [])
+      assert.deepEqual(paths('cat /etc/hosts > /dev/null 2>&1'), ['/etc/hosts'])
+    })
+
+    it('写裸设备 /dev/sda → 不产出路径', () => {
+      assert.deepEqual(paths('echo x > /dev/sda'), [])
+      assert.deepEqual(paths('dd if=/etc/hosts of=/dev/disk2'), [])
+    })
+
+    it('读 /dev/null 同样不产出路径', () => {
+      assert.deepEqual(paths('cat /dev/null'), [])
+      assert.deepEqual(paths('cat /dev/urandom | head -c 8'), [])
+    })
+
+    it('/proc /sys /run 一并挡（含 /proc/sys 内核开关）', () => {
+      assert.deepEqual(paths('cat /proc/self/status'), [])
+      assert.deepEqual(paths('echo 1 > /proc/sys/kernel/panic'), [])
+      assert.deepEqual(paths('echo 0 > /sys/class/leds/x/brightness'), [])
+      assert.deepEqual(paths('rm -f /run/app.pid'), [])
+    })
+
+    it('反证：同前缀词根不误伤', () => {
+      assert.deepEqual(paths('cat /device/notes.txt'), ['/device/notes.txt'])
+      assert.deepEqual(paths('cat /procfs.txt'), ['/procfs.txt'])
+      assert.deepEqual(paths('cat /runtime/a.txt'), ['/runtime/a.txt'])
+    })
+
+    // v0.7.22：内层候选过滤也必须挡根路径（`acp.js` 注释承诺"直接调用也安全"）。
+    // 出口的 filterPseudoFs 已挡，但 scanExecuteCommandPaths 是导出面，直连时不能漏。
+    it('直连 scanExecuteCommandPaths 时根路径也不得提取', () => {
+      assert.deepEqual(paths('ls /'), [])
+      assert.deepEqual(paths('ls //'), [])
+      assert.deepEqual(paths('ls ///'), [])
+      assert.deepEqual(paths('ls /tmp/x'), ['/tmp/x'], '不误伤正常绝对路径')
+    })
+
+    // v0.7.22【出口统一过滤】：伪 FS 过滤必须同时覆盖**结构化**路径。
+    // `rawInput.file_path` 是本轮为 codebuddy Write 新接的字段 —— 只在命令扫描里
+    // 过滤等于把洞挪到新路上（`{file_path:'/dev/sda'}` ⇒ suggestedDirs 取 dirname
+    // ⇒ 预填 /dev ⇒ 落 paths:['/dev'] ⇒ 之后 `> /dev/sda` 自动放行）。
+    it('结构化 file_path 指向伪 FS → 一律过滤', () => {
+      assert.deepEqual(extractPaths({ kind: 'write', rawInput: { file_path: '/dev/sda' } }), [])
+      assert.deepEqual(extractPaths({ kind: 'write', rawInput: { file_path: '/proc/sys/kernel/panic' } }), [])
+      assert.deepEqual(extractPaths({ kind: 'write', rawInput: { file_path: '/sys/class/leds/x/brightness' } }), [])
+      assert.deepEqual(extractPaths({ kind: 'write', rawInput: { file_path: '/run/app.pid' } }), [])
+      assert.deepEqual(extractPaths({ locations: [{ path: '/dev/sda' }, { path: '/proj/ok.txt' }] }), ['/proj/ok.txt'])
+    })
+
+    it('结构化正常绝对路径不被误伤', () => {
+      assert.deepEqual(extractPaths({ kind: 'write', rawInput: { file_path: '/proj/a.txt' } }), ['/proj/a.txt'])
+      assert.deepEqual(extractPaths({ kind: 'write', rawInput: { file_path: '/device/a.txt' } }), ['/device/a.txt'],
+        '前缀边界锚定：/device 不是 /dev')
+    })
+
+    // inferredDirs 的来源是 scanPathsLoose（独立于 extractPaths 再走一遍 toolCall），
+    // 它的 PATH_KEY 分支不看前缀 ⇒ 必须在本函数出口也过滤，否则预填仍会出现 /dev。
+    it('scanPathsLoose 也不得产出伪 FS 路径（inferredDirs 的唯一来源）', () => {
+      assert.deepEqual(scanPathsLoose({ kind: 'write', rawInput: { file_path: '/dev/sda' } }), [])
+      assert.deepEqual(scanPathsLoose({ kind: 'write', rawInput: { file_path: '/proj/a.txt' } }), ['/proj/a.txt'])
+    })
+  })
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // v0.7.22【贯通测试】：extractPaths 的产物直接喂规则层。
+  // 终审 B1 之所以漏网，就是因为此前**没有任何**测试把两者接起来 ——
+  // "提取对了、但规则层不认"这种断层只能靠贯通断言发现。
+  // ────────────────────────────────────────────────────────────────────────────
+  describe('贯通：extractPaths → evaluateRuleSources(workspace)', () => {
+    let cwd
+    beforeEach(() => {
+      cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-e2e-'))
+      fs.mkdirSync(path.join(cwd, 'scratch'))
+      fs.writeFileSync(path.join(cwd, 'scratch', 'existing.txt'), 'x\n')
+      fs.writeFileSync(path.join(cwd, 'notes.txt'), 'x\n')
+    })
+    afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }))
+
+    const workspace = () => [{ tier: 'workspace', rules: workspaceRuleOf(cwd) }]
+    const verdict = (command) => {
+      const paths = extractPaths({ rawInput: { command } }, { cwd })
+      return { paths, ...evaluateRuleSources(workspace(), { paths, cwd }) }
+    }
+
+    it('相对路径（已存在）必须命中工作区默认规则 ⇒ allowed=true', () => {
+      const r = verdict('cat scratch/existing.txt')
+      assert.equal(r.allowed, true, `paths=${JSON.stringify(r.paths)} 必须命中 workspace`)
+      assert.equal(r.via, 'paths')
+      assert.deepEqual(r.uncovered, [])
+      // 路径必须是绝对：相对路径会让 canonicalPath() 返回 null（终审 Blocker）
+      assert.ok(path.isAbsolute(r.paths[0]))
+    })
+
+    it('相对路径（新建、不存在）同样 allowed=true', () => {
+      const r = verdict('touch scratch/new.txt')
+      assert.equal(r.allowed, true)
+      assert.ok(path.isAbsolute(r.paths[0]))
+      // expandPathsWithParents 要能拿到"文件 + 父目录"
+      const exp = expandPathsWithParents(r.paths)
+      assert.ok(exp.includes(path.join(cwd, 'scratch', 'new.txt')))
+      assert.ok(exp.includes(path.join(cwd, 'scratch')))
+    })
+
+    it('`./` 前缀不回归（原本就 allowed=true）', () => {
+      assert.equal(verdict('cat ./notes.txt').allowed, true)
+    })
+
+    it('工作区外的相对路径不得命中（防止 resolve 把 cwd 当万能钥匙）', () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-outside-'))
+      fs.writeFileSync(path.join(outside, 'x.txt'), 'x\n')
+      const paths = extractPaths({ rawInput: { command: `cat ${path.join(outside, 'x.txt')}` } }, { cwd })
+      assert.equal(evaluateRuleSources(workspace(), { paths, cwd }).allowed, false)
+      fs.rmSync(outside, { recursive: true, force: true })
+    })
+  })
+
+  // v0.7.22【Major】：URL 不是路径。`//host/p` 一旦进 paths，legacy 授权会经
+  // expandPathsWithParents 产出 `["/example.com","/"]` ⇒ 会话内全盘放行。
+  describe('贯通：URL 不得产出路径（尤其不得产出根路径）', () => {
+    const paths = (command) => extractPaths({ rawInput: { command } }, { cwd: '/proj' })
+    const noRoot = (arr) => arr.every((p) => !/^\/+$/.test(p) && !/\/\//.test(p))
+
+    it('http(s)/ssh URL 整段丢弃，不残留 //host', () => {
+      assert.deepEqual(paths('curl https://api.github.com/repos/a/b'), [])
+      assert.deepEqual(paths('curl http://example.com/a.txt'), [])
+      assert.deepEqual(paths('git clone ssh://git@github.com/a/b.git'), [])
+      assert.deepEqual(paths('curl //example.com/path'), [])
+    })
+
+    it('file:/// 仍能取到 /tmp/x.txt（baseline 语义），且不产生 ///', () => {
+      assert.deepEqual(paths('curl file:///tmp/x.txt'), ['/tmp/x.txt'])
+    })
+
+    it('任何输入都不得产出 "/" 或 "//"', () => {
+      for (const c of [
+        'curl https://api.github.com/a/b',
+        'curl //example.com',
+        'cat //',
+        'cat /',
+        'echo x > //',
+        'wget ftp://h/p',
+        'curl ws://h/p',
+      ]) assert.ok(noRoot(paths(c)), `${c} 产出了根路径：${JSON.stringify(paths(c))}`)
+    })
   })
 })

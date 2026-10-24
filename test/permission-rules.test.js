@@ -588,3 +588,46 @@ describe('老 allowlist.json 只读兼容（临时目录断言，绝不写用户
     })
   })
 })
+
+// v0.7.22【纵深防御】：纯根路径不得编译成规则。
+// 原语 `coverage(['/etc/passwd'],['//'])` 在改前是 allowed:true（全盘放行）；
+// 上游三处入口过滤都是单点依赖，这里在编译点兜底。
+describe('v0.7.22 根路径规则不可命中', () => {
+  for (const raw of ['/', '//', '///']) {
+    it(`compileRulePath(${JSON.stringify(raw)}) 不得覆盖任何路径`, () => {
+      assert.equal(compileRulePath(raw), null, '纯根路径不编译成规则')
+      assert.equal(coverage(['/etc/passwd'], [raw]).allowed, false, '/etc/passwd 不得被根规则覆盖')
+      assert.equal(coverage(['/a/b'], [raw]).allowed, false)
+    })
+  }
+
+  it('非根规则的编译语义逐字不变（不回归）', () => {
+    // ⚠️ 已知的环境依赖：`kind:'dir'` 来自 compileRulePath 的"不存在则按字面启发式"
+    // （basename 无扩展名 ⇒ dir）。若宿主上 `/a` 真实存在且是文件/软链，本断言会红。
+    // 概率极低（POSIX 根下通常没有 /a），留档不改；要彻底稳定需改成 mkdtemp 夹具。
+    assert.deepEqual(compileRulePath('/a'), { raw: '/a', value: '/a', kind: 'dir' })
+    assert.equal(coverage(['/a/b'], ['/a']).allowed, true)
+    assert.equal(coverage(['/a/b'], ['/a/*']).allowed, true)
+    assert.equal(coverage(['/a/b.txt'], ['/a/b.txt']).allowed, true)
+    assert.equal(coverage(['/etc/passwd'], ['/a']).allowed, false)
+  })
+})
+
+// v0.7.22【收紧】：协议相对 URL / scheme:// 不是路径，不得进声明集。
+describe('v0.7.22 validateDeclaredPaths 拒绝 URL 形态', () => {
+  it('//example.com 与 file:// 落入 dropped', () => {
+    const r1 = validateDeclaredPaths(['//example.com'])
+    assert.deepEqual(r1.declared, [])
+    assert.equal(r1.dropped.length, 1)
+    assert.match(r1.dropped[0].reason, /URL|非法/)
+
+    const r2 = validateDeclaredPaths(['file:///tmp/x.txt'])
+    assert.deepEqual(r2.declared, [])
+    assert.equal(r2.dropped.length, 1)
+  })
+
+  it('合法绝对路径不被误伤', () => {
+    assert.deepEqual(validateDeclaredPaths(['/Users/x', '/tmp/y']).declared, ['/Users/x', '/tmp/y'])
+    assert.deepEqual(validateDeclaredPaths(['/Users/x']).dropped, [])
+  })
+})

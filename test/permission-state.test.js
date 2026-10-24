@@ -7,6 +7,7 @@ import {
   createSessionRules,
   permissionCategoryKey,
   resolveToolName,
+  metaToolName,
 } from '../lib/permission-state.js'
 import { categoryRule, expandPathsWithParents, isCategoryRule } from '../lib/allowlist.js'
 
@@ -670,5 +671,97 @@ describe('v0.7.9 复审 M-3：cwd 绑定的会话规则不跨 cwd 生效', () =>
     assert.equal(rules.size('parent-1'), 1)
     rules.add('parent-1', ['/proj/a.txt'], null, '/other')
     assert.equal(rules.size('parent-1'), 2, '不同 cwd 是两个作用域，各自留一条')
+  })
+})
+
+// ── v0.7.22：_meta 扁平带点命名空间的工具名（codebuddy 实测形态） + 跨产品隔离 ──
+//
+// 真机载荷（`session/request_permission` 的 `params.toolCall`，全部键只有
+// `toolCallId` / `rawInput` / `_meta` 三个）：
+//   { toolCallId: 'call_…', rawInput: { command: 'ls …' },
+//     _meta: { 'codebuddy.ai/toolName': 'Bash' } }
+// qoder 的形态是 `_meta.qoder = { toolName }`（命名空间作为一级键、值是对象），
+// 两条路互不重叠，必须各自成立且**不得串读**。
+describe('v0.7.22 _meta 扁平点命名空间工具名', () => {
+  const cbFrame = (toolName) => ({ toolCallId: 'tc-cb', rawInput: { command: 'ls' }, _meta: { 'codebuddy.ai/toolName': toolName } })
+
+  it('codebuddy 点号键：可执行名与配置名两种 product 都认得', () => {
+    for (const product of ['codebuddy', 'code-buddy', 'CODE-BUDDY']) {
+      assert.deepEqual(
+        resolveToolName(cbFrame('Bash'), product),
+        { value: 'Bash', source: '_meta(TOOL_NAME_SLUGS)' },
+        `product=${product}：命名空间段 codebuddy.ai 的首段归一后应命中本产品`,
+      )
+    }
+  })
+
+  it('跨产品隔离：别人的命名空间一律不读（首版实现的实测缺陷）', () => {
+    // 首版只判「键名以 /toolName 结尾」，`_meta['qoder/toolName']` 在 claude-code 帧里
+    // 也被读了出来（对比改动前后：BASE=null → WORK="Write"）。那让一个产品能借别的
+    // 产品的命名空间决定自己能否免弹，违反本模块「各产品只读自己命名空间」的不变式。
+    const foreign = { toolCallId: 'tc-x', _meta: { 'qoder/toolName': 'Write' } }
+    assert.equal(resolveToolName(foreign, 'claude-code'), null, 'claude-code 不得读到 qoder/toolName')
+    assert.equal(resolveToolName(foreign, 'codebuddy'), null, 'codebuddy 不得读到 qoder/toolName')
+    assert.deepEqual(resolveToolName(foreign, 'qoder'), { value: 'Write', source: '_meta(TOOL_NAME_SLUGS)' }, 'qoder 读自己的照旧')
+
+    const cb = cbFrame('Bash')
+    assert.equal(resolveToolName(cb, 'qoder'), null, 'qoder 不得读到 codebuddy.ai/toolName')
+    assert.equal(resolveToolName(cb, 'claude-code'), null, 'claude-code 不得读到 codebuddy.ai/toolName')
+  })
+
+  it('product 缺失/不可归一 ⇒ 不读任何命名空间（fail-closed，不退化成跨产品读）', () => {
+    assert.equal(resolveToolName(cbFrame('Bash')), null, '单参调用不得读点号命名空间')
+    assert.equal(resolveToolName(cbFrame('Bash'), ''), null)
+    assert.equal(resolveToolName(cbFrame('Bash'), '   '), null)
+  })
+
+  it('v0.7.22 收口：命名空间归属认「首段全等」，后续段不得单独冒充产品', () => {
+    // 复审实测缺陷（m00825 必修 3）：首版按 `.` 切段后「任一段命中即认」⇒ 命名空间
+    // `codebuddy.ai` 的第二段是 `ai`，于是 product='ai' 也能读出 Bash。一个产品只要能
+    // 猜到别人的子域/TLD 段名就能借别人的命名空间免弹。
+    const cb = cbFrame('Bash')
+    for (const product of ['ai', 'codebuddy.ai', 'claude-code', 'qoder', '', '   ', undefined]) {
+      assert.equal(resolveToolName(cb, product), null,
+        `product=${JSON.stringify(product)} 不得读到 codebuddy.ai/toolName`)
+    }
+    for (const product of ['codebuddy', 'code-buddy', 'CODE-BUDDY']) {
+      assert.deepEqual(resolveToolName(cb, product), { value: 'Bash', source: '_meta(TOOL_NAME_SLUGS)' },
+        `product=${product} 应读到自家命名空间`)
+    }
+  })
+
+  it('v0.7.22 收口：授权与展示取键顺序一致（同一套候选，不得各写一遍）', () => {
+    // 复审实测缺陷（m00825 必修 4）：首版两处顺序不同 ⇒ 两形态并存时授权取 Read、
+    // 展示取 Write，弹窗告诉用户"这是 Write"，落库的却是 Read 的授权键 ——
+    // 用户看到的授权对象与实际授权的对象不一致。
+    const cases = [
+      [{ qoder: { toolName: 'Read' }, 'qoder/toolName': 'Write' }, 'qoder'],
+      [{ 'qoder/toolName': 'Write' }, 'qoder'],
+      [{ qoder: { toolName: 'Read' } }, 'qoder'],
+      [{ toolName: 'Read' }, 'qoder'],
+      [{ qoder: { toolName: 'Read' }, toolName: 'Write' }, 'qoder'],
+      [{ 'codebuddy.ai/toolName': 'Bash', toolName: 'Write' }, 'codebuddy'],
+    ]
+    for (const [meta, product] of cases) {
+      const auth = resolveToolName({ _meta: meta }, product)
+      const shown = metaToolName({ _meta: meta }, product)
+      assert.equal(shown, auth ? auth.value : '', `${JSON.stringify(meta)} / ${product}：展示与授权必须取同一个值`)
+    }
+  })
+
+  it('点号键仍要过 TOOL_NAME_SLUGS 白名单（不是"有名字就认"）', () => {
+    assert.equal(resolveToolName(cbFrame('ApplyPatch'), 'codebuddy'), null, '白名单外的名字不得成为授权键')
+    assert.equal(resolveToolName(cbFrame('external_directory'), 'codebuddy'), null, '权限范围 slug 仍被拒')
+  })
+
+  it('既有来源优先级不变：嵌套命名空间 / 扁平 toolName 都排在点号键之前', () => {
+    const both = { toolCallId: 'tc-b', _meta: { qoder: { toolName: 'Read' }, 'qoder/toolName': 'Write' } }
+    assert.deepEqual(resolveToolName(both, 'qoder'), { value: 'Read', source: '_meta(TOOL_NAME_SLUGS)' }, '嵌套优先于点号键')
+    const flatFirst = { toolCallId: 'tc-f', _meta: { toolName: 'Read', 'qoder/toolName': 'Write' } }
+    assert.deepEqual(resolveToolName(flatFirst, 'qoder'), { value: 'Read', source: '_meta(TOOL_NAME_SLUGS)' }, '扁平 toolName 优先于点号键')
+    // 白名单闸是**逐个候选**过的（既有行为，非本次引入）：`Grep` 不是 TOOL_NAME_SLUGS 成员
+    // ⇒ 该候选被跳过，于是点号键的 `Write` 顶上。这里把该行为记录下来，改它就是改语义。
+    const grepFirst = { toolCallId: 'tc-g', _meta: { toolName: 'Grep', 'qoder/toolName': 'Write' } }
+    assert.deepEqual(resolveToolName(grepFirst, 'qoder'), { value: 'Write', source: '_meta(TOOL_NAME_SLUGS)' }, '白名单外候选被跳过，后续候选顶上（逐候选过滤）')
   })
 })

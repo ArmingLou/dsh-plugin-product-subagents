@@ -610,7 +610,13 @@ describe('v0.7.9 第三轮复审 B-1：危险门与 kind 解耦（fail-safe）�
     // 改前（原文）：assert.equal(dangerousExecuteMatch({ rawInput: { command: 'rm -rf /tmp/z' } }), null)
     // 改后：**带命令字段 ⇒ 门命中**（与"改动①"同因：命令字段与 `kind` 无关，门宁可多问）。
     assert.equal(dangerousExecuteMatch({ rawInput: { command: 'rm -rf /tmp/z' } }).rule, 'rm -rf')
-    assert.deepEqual(extractPaths({ rawInput: { command: 'rm -rf /tmp/z' } }), [], '路径侧照旧不认这种帧（不对称）')
+    // v0.7.22【改动的既有断言】：旧期望 `[]` + 注释"路径侧照旧不认这种帧（不对称）"。
+    // 那条不对称在 codebuddy 载荷下就是"目录为空"的缺陷本身（它不发 kind/name/title，
+    // 只有 rawInput.command）。现已由 isExecuteFrame 的第三判据收口：有 command 即执行帧。
+    // 危险门这一侧**为什么仍然安全**：`rm -rf` 的命中与 kind 无关（门宁可多问），
+    // 路径侧现在也会把 `/tmp/z` 收进请求集合 —— 方向都是"更严"，不是放行。
+    assert.deepEqual(extractPaths({ rawInput: { command: 'rm -rf /tmp/z' } }), ['/tmp/z'],
+      'v0.7.22：无 kind 但有命令字段 ⇒ 路径侧同样认定为执行类帧（不再空集）')
     // 而没有命令字段时，"执行类 name/title slug 兜底"的判定不变：`title` 不是执行类 slug
     // ⇒ title 不作为命令正文（否则任何标题里出现命令字样的帧都会被问，天天误伤）。
     assert.equal(dangerousExecuteMatch({ title: 'rm -rf /tmp/z' }), null)

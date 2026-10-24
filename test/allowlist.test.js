@@ -78,3 +78,24 @@ test('allowlistDecision: 无规则 → 不自动放行', () => {
   assert.equal(allowlistDecision(['/x'], undefined).allowed, false)
   assert.equal(allowlistDecision(['/x'], []).allowed, false)
 })
+
+// ── expandPathsWithParents：根 token 过滤（v0.7.22）──
+// 本函数是 `/` 的**实际产生地**：dirname('//example.com') 在 POSIX 下是 '//'，
+// 而 compileRulePath('//') 归一成 '/' ⇒ 一条规则覆盖全盘。提取层出口的 ROOT_PATH_RE
+// 只挡入口，挡不住这里的派生结果。
+import { expandPathsWithParents } from '../lib/allowlist.js'
+
+test('expandPathsWithParents: 不派生根 token', () => {
+  const r = expandPathsWithParents(['//example.com'])
+  assert.equal(r.includes('/'), false, `不得产出 /：${JSON.stringify(r)}`)
+  assert.equal(r.includes('//'), false, `不得产出 //：${JSON.stringify(r)}`)
+  assert.deepEqual(r, ['/example.com'])
+})
+
+test('expandPathsWithParents: 纯根输入直接丢弃', () => {
+  assert.deepEqual(expandPathsWithParents(['/', '//', '///']), [])
+})
+
+test('expandPathsWithParents: 正常路径的文件+父目录不受影响', () => {
+  assert.deepEqual(expandPathsWithParents(['/a/b.txt']), ['/a/b.txt', '/a'])
+})

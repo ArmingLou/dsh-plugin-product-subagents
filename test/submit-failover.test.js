@@ -38,6 +38,8 @@ describe('classifySubmitFailure：失败分级', () => {
 
   it('空正文 / 超时 / 传输中断判为 failover', () => {
     assert.equal(classifySubmitFailure('EMPTY_RESPONSE', 'deveco 返回空正文（无任何文本输出）'), FAILOVER)
+    // ACP 语义性拒绝：换一档模型可能不再拒绝 ⇒ 可换档（不是 fatal，也不是 interrupted）
+    assert.equal(classifySubmitFailure('ACP_REFUSAL', 'The ACP agent declined to answer this request.'), FAILOVER)
     assert.equal(classifySubmitFailure('SUBMIT_TIMEOUT', 'deveco ACP prompt idle timeout'), FAILOVER)
     assert.equal(classifySubmitFailure(null, 'socket hang up'), FAILOVER)
     assert.equal(classifySubmitFailure(null, 'ECONNRESET while reading stream'), FAILOVER)
@@ -63,6 +65,17 @@ describe('classifySubmitFailure：失败分级', () => {
   it('人为中断判为 interrupted（既不换档也不算产品故障）', () => {
     assert.equal(classifySubmitFailure('SUBMIT_ABORTED', 'aborted'), INTERRUPTED)
     assert.equal(classifySubmitFailure('WATCHDOG_CLOSED', 'child 已关闭'), INTERRUPTED)
+  })
+
+  it('产品进程崩溃判为 failover；WATCHDOG_FREEZE 不再是 interrupted（死码清理）', () => {
+    // 桥内 kill→reconnect 预算耗尽后抛 PRODUCT_CRASH：换一档产品/模型很可能不再崩
+    assert.equal(
+      classifySubmitFailure('PRODUCT_CRASH', 'ACP product process crashed/exited (after 3 reconnect attempts): exitCode=1, signal=null'),
+      FAILOVER,
+    )
+    // WATCHDOG_FREEZE 只在桥内流转（catch 成重连），从不外抛；即便泄漏也不得被当成人为中断，
+    // 否则"进程反复冻结"会被判为"用户取消"而不换档。
+    assert.notEqual(classifySubmitFailure('WATCHDOG_FREEZE', 'deveco 看门狗触发：180000ms 无输出'), INTERRUPTED)
   })
 
   it('未知错误兜底 failover——只有被明确归入 fatal 的那一类才停止换档', () => {

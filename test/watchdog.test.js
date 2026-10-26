@@ -65,7 +65,7 @@ describe('isClosed callback integration', () => {
 })
 
 describe('watchdog freeze detection', () => {
-  it('WATCHDOG_FREEZE triggers kill+closeSession when no output for watchdogNoOutputMs', async () => {
+  it('WATCHDOG_FREEZE 触发 kill+closeSession，重连不可用时抛 PRODUCT_CRASH（不再无限重试）', async () => {
     const bridge = createAcpBridge({ watchdogNoOutputMs: 80, spawn: failSpawn })
     let killSigSent = false
     let closeSessionCalled = false
@@ -95,25 +95,26 @@ describe('watchdog freeze detection', () => {
     }
     const isClosed = () => false
     const ac = new AbortController()
-    // Abort after 2s to prevent infinite loop (reconnect fails without real process)
-    const timeout = setTimeout(() => ac.abort(), 2000)
+    // 兜底超时：若重连预算失效（旧行为），abort 兜住无限循环。
+    const timeout = setTimeout(() => ac.abort(), 5000)
+    let code = null
+    let message = ''
     try {
       await bridge.submit(remote, 'task', ac.signal, '/tmp', {}, isClosed)
     } catch (err) {
-      clearTimeout(timeout)
-      // After abort, should get SUBMIT_ABORTED (abort wins) or WATCHDOG_CLOSED
-      assert.ok(
-        err.code === 'SUBMIT_ABORTED' || err.code === 'WATCHDOG_CLOSED',
-        `Expected SUBMIT_ABORTED/WATCHDOG_CLOSED, got ${err.code}: ${err.message}`,
-      )
+      code = err.code
+      message = err.message
     }
     clearTimeout(timeout)
-    // The key assertion: watchdog freeze DID trigger kill+closeSession
+    // 冻结 → kill → 重连（假 spawn 必失败）→ 预算 3 次耗尽 → PRODUCT_CRASH（failover 级）
+    assert.equal(code, 'PRODUCT_CRASH', `Expected PRODUCT_CRASH, got ${code}: ${message}`)
+    assert.match(message, /crashed\/exited \(after 3 reconnect attempts\)/)
+    // 关键行为保留：冻结确实 kill 了进程并关闭了会话
     assert.ok(killSigSent, 'Expected SIGKILL to be sent on freeze')
     assert.ok(closeSessionCalled, 'Expected closeSession to be called on freeze')
   })
 
-  it('watchdog continues retrying after reconnect failure (does not throw reconnect error)', async () => {
+  it('重连预算耗尽前不抛错：reconnect 失败仍继续重试（只在超限时才抛 PRODUCT_CRASH）', async () => {
     const bridge = createAcpBridge({ watchdogNoOutputMs: 80, spawn: failSpawn })
     let killSigSent = false
     let closeSessionCalled = false
@@ -145,25 +146,107 @@ describe('watchdog freeze detection', () => {
     }
     const isClosed = () => false
     const ac = new AbortController()
-    // Let it run for 2s (should trigger multiple freeze→kill→reconnect-fail cycles)
-    // then abort. If reconnect failure leaked as throw, we'd get a non-SUBMIT_ABORTED error.
-    const timeout = setTimeout(() => ac.abort(), 2000)
+    const timeout = setTimeout(() => ac.abort(), 5000)
     let caughtCode = null
     try {
       await bridge.submit(remote, 'task', ac.signal, '/tmp', {}, isClosed)
     } catch (err) {
-      clearTimeout(timeout)
       caughtCode = err.code
     }
     clearTimeout(timeout)
-    // Must NOT get a raw reconnect error (ENOENT, "ACP connection closed", etc)
-    // Only legitimate termination codes are acceptable
+    // 不得泄漏原始 reconnect 错误（ENOENT / ACP connection closed）——那是内部细节，
+    // 对外只允许 PRODUCT_CRASH（预算耗尽）或 abort/close 类终止码。
     assert.ok(
-      caughtCode === 'SUBMIT_ABORTED' || caughtCode === 'WATCHDOG_CLOSED',
+      caughtCode === 'PRODUCT_CRASH' || caughtCode === 'SUBMIT_ABORTED' || caughtCode === 'WATCHDOG_CLOSED',
       `Expected loop termination code, got ${caughtCode} (reconnect error leaked from watchdog loop)`,
     )
+    assert.ok(promptAttemptCount >= 1, 'Expected at least one prompt attempt')
     assert.ok(killSigSent, 'Expected at least one SIGKILL')
     assert.ok(closeSessionCalled, 'Expected at least one closeSession')
+  })
+})
+
+describe('PRODUCT_CRASH：盲重试预算（每次新 prompt 重置）', () => {
+  const flakyPrompt = (failures) => ({ onPrompt: ({ msg, send }) => {
+    if (failures.left > 0) {
+      failures.left -= 1
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'ACP connection closed (mock)' } })
+      return 'handled'
+    }
+    return 'default'
+  } })
+
+  it('传输中断（connection closed）重连成功 → 重发同一 prompt，不抛错', async () => {
+    const failures = { left: 1 }
+    const agent = fakeAgent(OPENCODE_LIKE, flakyPrompt(failures))
+    const bridge = createAcpBridge({ command: 'opencode', spawn: agent.spawn })
+    const remote = await bridge.create('/tmp')
+    const out = await bridge.submit(remote, 'task', new AbortController().signal, '/tmp')
+    assert.equal(out.text, 'fake answer')
+    assert.equal(agent.state.promptCount, 2, '一次中断 + 一次重发')
+    await bridge.dispose(remote)
+  })
+
+  it('每次新 prompt 调用重置预算：上一轮用掉 2 次，下一轮仍可用满 3 次', async () => {
+    const failures = { left: 2 }
+    const agent = fakeAgent(OPENCODE_LIKE, flakyPrompt(failures))
+    const bridge = createAcpBridge({ command: 'opencode', spawn: agent.spawn })
+    const remote = await bridge.create('/tmp')
+    const first = await bridge.submit(remote, 'task', new AbortController().signal, '/tmp')
+    assert.equal(first.text, 'fake answer')
+    assert.equal(agent.state.promptCount, 3, '2 次中断 + 1 次成功')
+    // 第二轮连挂 3 次仍在预算内（若计数器没重置，这里会在第 2 次中断就抛 PRODUCT_CRASH）
+    failures.left = 3
+    const second = await bridge.submit(remote, 'task-2', new AbortController().signal, '/tmp')
+    assert.equal(second.text, 'fake answer')
+    assert.equal(agent.state.promptCount, 7, '3 次中断 + 1 次成功')
+    await bridge.dispose(remote)
+  })
+
+  it('传输中断且重连预算耗尽 → PRODUCT_CRASH（带 reason 与退出快照）', async () => {
+    const failures = { left: 99 }
+    const agent = fakeAgent(OPENCODE_LIKE, flakyPrompt(failures))
+    const bridge = createAcpBridge({ command: 'opencode', spawn: agent.spawn })
+    const remote = await bridge.create('/tmp')
+    let caught = null
+    try {
+      await bridge.submit(remote, 'task', new AbortController().signal, '/tmp')
+    } catch (err) {
+      caught = err
+    }
+    assert.ok(caught, 'should have thrown')
+    assert.equal(caught.code, 'PRODUCT_CRASH')
+    assert.equal(caught.reason, 'prompt_transport_error')
+    assert.equal(caught.reconnectAttempts, 3)
+    assert.match(caught.message, /crashed\/exited \(after 3 reconnect attempts\): exitCode=/)
+    assert.equal(agent.state.promptCount, 4, '1 次首发 + 3 次重发后放弃')
+    await bridge.dispose(remote)
+  })
+
+  it('进程已退出（transportDead）且重连失败 → PRODUCT_CRASH，错误里带真实 exitCode', async () => {
+    const bridge = createAcpBridge({ command: 'opencode', spawn: failSpawn })
+    const remote = {
+      sessionId: 'dead-test',
+      proc: { exitCode: 1, signalCode: null, kill() {} },
+      connection: {
+        async prompt() { await new Promise(() => {}) },
+        closeSession() { return Promise.resolve() },
+      },
+      progressRef: () => ({ lastActivityAt: 0 }),
+      drainText: () => '',
+      stderrTail: () => '',
+      drainStderr: () => '',
+    }
+    let caught = null
+    try {
+      await bridge.submit(remote, 'task', new AbortController().signal, '/tmp')
+    } catch (err) {
+      caught = err
+    }
+    assert.ok(caught, 'should have thrown')
+    assert.equal(caught.code, 'PRODUCT_CRASH')
+    assert.equal(caught.reason, 'transport_dead')
+    assert.match(caught.message, /exitCode=1, signal=null/)
   })
 })
 
@@ -259,12 +342,12 @@ describe('watchdog permission-pending exemption', () => {
     // 前 500ms 权限挂起（豁免期）；随后解除挂起但无输出 → 冻结应触发
     setTimeout(() => { pending = false }, 500)
     const ac = new AbortController()
-    const timeout = setTimeout(() => ac.abort(), 3000)
+    const timeout = setTimeout(() => ac.abort(), 5000)
     let code = null
     try { await bridge.submit(remote, 'task', ac.signal, '/tmp', {}, () => false) } catch (e) { code = e.code }
     clearTimeout(timeout)
-    // 挂起期间不应 kill；解除后冻结会 kill→reconnect(假 spawn 失败)→循环→abort 终止
-    assert.ok(code === 'SUBMIT_ABORTED' || code === 'WATCHDOG_CLOSED', `got ${code}`)
+    // 挂起期间不应 kill；解除后冻结会 kill→reconnect(假 spawn 失败)→预算耗尽→PRODUCT_CRASH
+    assert.ok(code === 'PRODUCT_CRASH' || code === 'SUBMIT_ABORTED' || code === 'WATCHDOG_CLOSED', `got ${code}`)
     assert.ok(killSig, 'freeze after pending released should have killed')
   })
 })
@@ -390,6 +473,12 @@ function fakeAgent(configOptions, behavior = {}) {
     }
     if (msg.method === 'session/prompt') {
       state.promptCount += 1
+      // 行为钩子：让用例能制造"prompt 期间传输中断"（JSON-RPC error 应答），
+      // 返回 'handled' 表示本回合由用例自己应答。
+      if (typeof behavior.onPrompt === 'function') {
+        const outcome = behavior.onPrompt({ state, msg, send, promptIndex: state.promptCount })
+        if (outcome === 'handled') return
+      }
       send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'ses_fake', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fake answer' } } } })
       send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } })
       return

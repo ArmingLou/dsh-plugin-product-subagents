@@ -12,12 +12,12 @@
 // 老模型 arguments.command）。因此本文件里三处 0.7.9 早期的断言被改成期望空集，
 // 每处都就地写明了理由；scanPathsLoose 仍被直接调用，只用于"旧实现确实会抓到
 // 正文假路径"的差分证明。
-import { describe, it, beforeEach, afterEach } from 'node:test'
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { extractPaths, extractStructuredPaths, scanPathsLoose, scanExecuteCommandPaths } from '../lib/bridges/acp.js'
+import { extractPaths, extractStructuredPaths, scanPathsLoose, scanExecuteCommandPaths, classifyPathToken, isJunkPathToken, executeScopeOf } from '../lib/bridges/acp.js'
 import { evaluateRuleSources, workspaceRuleOf } from '../lib/permission-rules.js'
 import { expandPathsWithParents } from '../lib/allowlist.js'
 
@@ -883,6 +883,35 @@ describe('v0.7.9 第六轮裁定：信封边界（rawInput/arguments 下数组�
       )
     })
 
+    // v0.7.28【追加 B1】：**结构化**相对路径（含分隔符 / 以 `..` 开头）豁免存在性校验。
+    // 现场：`cat package.json ../../package.json` 的越界操作数因为"落点不存在"被整条丢掉
+    // ⇒ 用户在授权面板里手动登记的上级目录永远匹配不到它。裸文件名（`missing.txt`）
+    // 仍按上一行处理：那类 token 是散文误判的高发形态。
+    it('结构化相对路径（含分隔符 / `..` 开头）不存在也提取；裸文件名仍不提', () => {
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat sub/missing.txt' } }, { cwd }),
+        [abs('sub/missing.txt')],
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat ../../package.json' } }, { cwd }),
+        [path.resolve(cwd, '../../package.json')],
+      )
+      // 边界：裸文件名不受影响
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat missing.txt' } }, { cwd }),
+        [],
+      )
+      // 边界：变量/通配符仍必须丢弃（B1 的教训）
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat ${HOME}/x' } }, { cwd }),
+        [],
+      )
+      assert.deepEqual(
+        scanExecuteCommandPaths({ rawInput: { command: 'cat sub/*.txt' } }, { cwd }),
+        [],
+      )
+    })
+
     // v0.7.22【Minor】：纯版本号不算"带扩展名"，即使 cwd 里真有同名文件。
     // 旧实现 `\.[A-Za-z0-9]{1,8}$` 会命中 `.2` ⇒ `git log v1.2` 被当路径。
     it('版本号形态即使存在同名文件也不提取', () => {
@@ -1058,5 +1087,253 @@ describe('v0.7.9 第六轮裁定：信封边界（rawInput/arguments 下数组�
         'curl ws://h/p',
       ]) assert.ok(noRoot(paths(c)), `${c} 产出了根路径：${JSON.stringify(paths(c))}`)
     })
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v0.7.23（H2 回归）：**缺字段载荷不得合成 "undefined" 路径段**。
+//
+// 现场：授权面板里出现过一条 `.../dsh-agent-dispatch/undefined` 的建议目录。
+// `undefined` 只要进了 paths 就是一条 uncovered ⇒ 整条请求必弹
+// （permission-rules.js 的 fail-closed 全覆盖），所以「代码会不会把缺字段拼成
+// 字面量 undefined」必须被钉死。结论（本组用例）：**不会** —— 三条产线全都要求
+// 字符串，`rawInput.file_path: undefined` / `locations[].path: undefined` /
+// JSON 里缺键，一律产出空集。现场那条字面量只能来自载荷/命令正文里**本来就有**的
+// 字符串（产品或命令模板拼出来的），不是本仓库合成的。
+// 这与 v0.7.22 的处理方向一致：路径提取只认**载荷里真实存在的字符串**。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v0.7.23 缺字段载荷不得合成 undefined 路径段', () => {
+  const WS = '/proj'
+  const bad = (p) => typeof p === 'string' && p.split('/').includes('undefined')
+  const all = (frame) => {
+    const paths = extractPaths(frame, { cwd: WS })
+    return { paths, loose: scanPathsLoose(frame) }
+  }
+
+  it('rawInput 字段缺省 / null / undefined ⇒ 空集，且不出现 undefined 段', () => {
+    for (const frame of [
+      { toolCallId: 't1', rawInput: { command: 'ls' } },
+      { toolCallId: 't2', rawInput: { file_path: undefined } },
+      { toolCallId: 't3', rawInput: { file_path: null } },
+      { toolCallId: 't4', rawInput: { paths: [undefined, null, ''] } },
+      { toolCallId: 't5', rawInput: {} },
+      { toolCallId: 't6', kind: 'execute' },
+      { toolCallId: 't7', locations: [{}, { path: undefined }] },
+      { toolCallId: 't8', kind: 'edit', content: [{ type: 'diff', path: undefined }] },
+      { toolCallId: 't9', arguments: '{"file_path":null}' },
+    ]) {
+      const r = all(frame)
+      assert.deepEqual(r.paths, [], `缺字段帧产出了路径：${JSON.stringify(r.paths)}`)
+      assert.deepEqual(r.loose, [], `scanPathsLoose 产出了路径：${JSON.stringify(r.loose)}`)
+      assert.equal([...r.paths, ...r.loose].some(bad), false)
+    }
+  })
+
+  it('对照：真实字段照常提取（不是把整条通道关掉）', () => {
+    const r = all({ toolCallId: 'ok', kind: 'write', rawInput: { file_path: '/proj/a.txt' } })
+    assert.deepEqual(r.paths, ['/proj/a.txt'])
+    assert.deepEqual(r.loose, ['/proj/a.txt'])
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v0.7.24【H2】：**正则字面量 / Shell 残片绝不进 paths**。
+//
+// 现场（一锤定音）：授权面板的「请求实际触达目录（建议）」里出现
+// `/(^|\/)undefined(\/|\$)/` —— 那是命令正文里一个**正则字面量**，因为以 `/` 开头
+// 被绝对路径分支无条件收下；还出现过 `<cwd>/{`、`<cwd>/undefined`、`<cwd>/=`。
+// 一条假路径就足以让整条请求 uncovered（coverage 要求全覆盖）⇒ 工作区内的普通命令
+// 也必弹。绝对路径分支此前**不做任何合法性校验**（相对路径至少有 existsSync 守卫）。
+//
+// 判据（只对"磁盘上不存在"的 token 生效，避免误杀 `lib [old]/a.txt` 这类合法名字）：
+//   · 含正则/Shell 元字符 `( ) [ ] { } | \ * ? ^ $ ` `；
+//   · 路径段是字面量 `undefined` / `null` / `NaN`；
+//   · `=` 残片（`--key=` 截断后的形态）。
+// 回归红线（必须继续提取）：`ls -la <存在的绝对路径>`、`mkdir -p .probe/x`、`cat ./a.txt`。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v0.7.24 H2：正则字面量 / Shell 残片不得被当成路径', () => {
+  let ws
+  beforeEach(() => {
+    ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-junk-'))
+    fs.mkdirSync(path.join(ws, 'sub'))
+    fs.writeFileSync(path.join(ws, 'sub', 'a.txt'), 'x\n')
+    fs.writeFileSync(path.join(ws, 'notes.txt'), 'x\n')
+  })
+  afterEach(() => fs.rmSync(ws, { recursive: true, force: true }))
+
+  const paths = (command) => extractPaths({ kind: 'execute', rawInput: { command } }, { cwd: ws })
+
+  it('node -e 里的正则字面量不进 paths（现场原文）', () => {
+    const got = paths('node -e "/(^|\\/)undefined(\\/|\\$)/.test(p)"')
+    assert.deepEqual(got, [], `正则字面量被当成了路径：${JSON.stringify(got)}`)
+  })
+
+  it('同类残片 `{` / `=` / `undefined` 段也不进 paths', () => {
+    assert.deepEqual(paths('echo x > {'), [])
+    assert.deepEqual(paths('echo x > ='), [])
+    assert.deepEqual(paths(`cat ${path.join(ws, 'undefined')}`), [])
+  })
+
+  it('回归红线：真实绝对路径 / 写目标 / 相对路径仍然提取', () => {
+    assert.deepEqual(paths(`ls -la ${path.join(ws, 'sub')}`), [path.join(ws, 'sub')])
+    assert.deepEqual(paths('mkdir -p .probe/x'), [path.join(ws, '.probe', 'x')])
+    assert.deepEqual(paths('cat ./notes.txt'), [path.join(ws, 'notes.txt')])
+  })
+
+  it('磁盘上真实存在的"怪名字"不被误杀（`lib[old]/a.txt`）', () => {
+    // 注：含**空格**的路径本来就被分词器切开（既有能力边界，不在本条范围内），
+    // 这里用只带方括号的名字验证"存在性优先于元字符判据"。
+    const odd = path.join(ws, 'lib[old]')
+    fs.mkdirSync(odd)
+    fs.writeFileSync(path.join(odd, 'a.txt'), 'x\n')
+    assert.deepEqual(paths(`cat ${path.join(odd, 'a.txt')}`), [path.join(odd, 'a.txt')])
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v0.7.25【B1 阻塞修复】：`classifyPathToken` 三态（junk / uncertain / path）
+//
+// 为什么必须**直接**单测这个函数：上一轮 154+443 测试全绿却放过 B1，根因是
+// 全部用例都只喂"存在或不存在的**普通**路径"，没有一条覆盖 `*` / `$VAR` / `${VAR}` /
+// `?` / `[1]` / `../../` 这些"字面量 ≠ 真身"的形态 —— 而这些形态正是 fail-open 的来源。
+// 三态契约：
+//   junk      ⇒ 丢弃（唯一允许丢的一类）
+//   uncertain ⇒ **不得**当作"没有路径"，也**不得**按字面量放行 ⇒ 转人工
+//   path      ⇒ 正常收下
+// ────────────────────────────────────────────────────────────────────────────
+describe('v0.7.25 B1：classifyPathToken 三态判定（直接单测）', () => {
+  let ws
+  before(() => {
+    ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tri-'))
+    fs.mkdirSync(path.join(ws, 'sub'))
+    fs.writeFileSync(path.join(ws, 'sub', 'a.txt'), 'x\n')
+    fs.writeFileSync(path.join(ws, 'notes.txt'), 'x\n')
+  })
+  after(() => fs.rmSync(ws, { recursive: true, force: true }))
+
+  const JUNK = () => [
+    '{', '}', '(', ')', '[', ']', '|', '`', '=', '--key=',
+    '/^[a-z]+$/i',                       // 正则字面量（锚点 + flag 收尾）
+    '/(^|\\/)undefined(\\/|\\$)/.test(p', // 现场原文分词后的形态
+    path.join(ws, 'undefined'),          // 模板拼错的路径段
+    path.join(ws, 'null'),
+  ]
+  const UNCERTAIN = () => [
+    '*',                                 // 裸通配
+    '$HOME/.ssh/id_rsa',                 // 变量
+    '${HOME}/.ssh/id_rsa',               // 花括号变量
+    '~/.ssh/*',                          // 家目录 + glob
+    '/etc/*.conf',                       // 工作区外 glob（**关键**：真实可读）
+    'a?.txt',                            // 单字符通配
+    'evil[1]',                           // 字符类
+    'x{1,2}',                            // 花括号展开
+    '$(whoami)/x',                       // 命令替换
+  ]
+  const PATHLIKE = () => [
+    ws,                                  // 存在的目录
+    path.join(ws, 'notes.txt'),          // 存在的文件
+    path.join(ws, 'sub', 'a.txt'),
+    './notes.txt',                       // 普通相对路径
+    'notes.txt',
+    '../../x',                           // 无元字符：形态上是路径，归属交上游判
+    '/usr/local/bin/node',
+  ]
+
+  it('junk 三态：只剩"不可能是路径客体"的语法残片', () => {
+    for (const raw of JUNK()) {
+      assert.equal(classifyPathToken(raw), 'junk', `${JSON.stringify(raw)} 应为 junk`)
+      assert.equal(isJunkPathToken(raw), true, `${JSON.stringify(raw)} 的兼容布尔面应为 true`)
+    }
+  })
+
+  it('uncertain：含 shell 展开成分的 token 一律"判不了"（绝不归 junk）', () => {
+    for (const raw of UNCERTAIN()) {
+      assert.equal(classifyPathToken(raw), 'uncertain', `${JSON.stringify(raw)} 应为 uncertain（判 junk 即 fail-open）`)
+      assert.equal(isJunkPathToken(raw), false, `${JSON.stringify(raw)} 不得被兼容布尔面判成 junk`)
+    }
+  })
+
+  it('path：不存在但形态正常的路径仍然是 path', () => {
+    for (const raw of PATHLIKE()) {
+      assert.equal(classifyPathToken(raw), 'path', `${JSON.stringify(raw)} 应为 path`)
+    }
+  })
+
+  it('存在性优先：磁盘上真实存在的"怪名字"不被元字符判据误杀', () => {
+    const odd = path.join(ws, 'lib[old]')
+    fs.mkdirSync(odd, { recursive: true })
+    fs.writeFileSync(path.join(odd, 'a.txt'), 'x\n')
+    assert.equal(classifyPathToken(path.join(odd, 'a.txt')), 'path')
+  })
+})
+
+describe('v0.7.25 B1：提取层/生效目录的方向性（fail-closed）', () => {
+  let ws
+  before(() => {
+    ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dir-'))
+    fs.mkdirSync(path.join(ws, 'sub'))
+    fs.mkdirSync(path.join(ws, 'test'))
+    fs.writeFileSync(path.join(ws, 'notes.txt'), 'x\n')
+    fs.writeFileSync(path.join(ws, 'test', 'a.test.js'), 'x\n')
+  })
+  after(() => fs.rmSync(ws, { recursive: true, force: true }))
+
+  const paths = (command) => extractPaths({ kind: 'execute', rawInput: { command } }, { cwd: ws })
+  const scope = (command) => executeScopeOf({ kind: 'execute', rawInput: { command } }, { cwd: ws })
+
+  it('绝对形态的 uncertain **收进 paths**（真身归属交规则层按字面子树判）', () => {
+    assert.deepEqual(paths('ls /etc/*.conf'), ['/etc/*.conf'])
+    assert.deepEqual(paths('cat ~/.ssh/*'), ['~/.ssh/*'])
+    assert.deepEqual(paths('mkdir -p /tmp/evil[1]'), ['/tmp/evil[1'])
+  })
+
+  it('工作区内的 glob 仍判"工作区内"（不得被一刀切顶成弹窗）', () => {
+    assert.deepEqual(paths(`cat ${path.join(ws, 'test', '*.test.js')}`), [path.join(ws, 'test', '*.test.js')])
+  })
+
+  it('相对形态的 uncertain **不得**被 resolve 成人造路径（B1 的 fail-open 根源）', () => {
+    assert.deepEqual(paths('cat $HOME/.ssh/id_rsa'), [])
+    assert.deepEqual(paths('cat ${HOME}/.ssh/id_rsa'), [])
+    assert.deepEqual(paths('cat ../*.js'), [])
+  })
+
+  it('pathFree：命令正文里出现 uncertain token ⇒ 必须为 false（转人工）', () => {
+    const CASES = [
+      'cat $HOME/.ssh/id_rsa',
+      'cat ${HOME}/.ssh/id_rsa',
+      'cat ~/.ssh/*',
+      'ls /etc/*.conf',
+      'echo pwned > /Users/arming/.*rc',
+      'mkdir -p /Users/arming/evil[1]',
+      'cat ../../.ssh/id_rsa',
+      // v0.7.25 附加收口：`//x` 在 POSIX 下就是 `/x`。`stripUrls` 的第 4 条只在**提取**
+      // 侧生效（防 `//example.com` 变 `/` 规则），`pathFree` 侧不得跟着抹掉。
+      'cat //etc/passwd',
+    ]
+    for (const command of CASES) {
+      assert.equal(scope(command).pathFree, false, `pathFree 未拦截：${command}`)
+    }
+    // 对照：一个路径 token 都没有的命令仍然 pathFree === true（`ls` 旁路不能被误杀）
+    assert.equal(scope('ls').pathFree, true)
+    assert.equal(scope('git status').pathFree, true)
+    // 对照：`cd` 目标由 effective-cwd 消费，不算"命令碰了路径"
+    assert.equal(scope('cd sub && ls').pathFree, true)
+  })
+
+  it('B2 回归：相对 token 的存在性探测以**命令生效目录**为基准，不是宿主 process.cwd()', () => {
+    // 造一个只存在于 process.cwd()、不在 `${ws}` 下的怪名字 token：
+    //   · 修复前：`path` 未导入 ⇒ ReferenceError 被空 catch 吞掉 ⇒ probe=null ⇒
+    //     existsSync('x[1]') 命中宿主 cwd ⇒ 判"存在于磁盘"⇒ 不是路径 ⇒ pathFree 误为 true；
+    //   · 修复后：probe = resolve(ws, 'x[1]') 不存在 ⇒ 判 uncertain ⇒ pathFree === false。
+    const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cwd-'))
+    const prev = process.cwd()
+    try {
+      fs.writeFileSync(path.join(fake, 'x[1]'), 'x\n')
+      process.chdir(fake)
+      assert.equal(scope('cat x[1]').pathFree, false, '相对 token 被按宿主 cwd 判成了"不存在路径"（B2 回归）')
+    } finally {
+      process.chdir(prev)
+      fs.rmSync(fake, { recursive: true, force: true })
+    }
   })
 })

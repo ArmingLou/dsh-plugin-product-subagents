@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { createPendingRegistry, createSessionRules, permissionCategoryKey, resolveToolName } from '../lib/permission-state.js'
 import { dangerousExecuteMatch, dangerPatternsPath, resetDangerPatternsCache } from '../lib/dangerous-commands.js'
 import { evaluateRuleSources, inferredDirs, planGrantWrites, suggestedDirs, workspaceRuleOf } from '../lib/permission-rules.js'
-import { extractPaths, extractStructuredPaths, scanPathsLoose } from '../lib/bridges/acp.js'
+import { executeScopeOf, extractPaths, extractStructuredPaths, scanPathsLoose } from '../lib/bridges/acp.js'
 import { appendUserRule, readUserAllowlist } from '../lib/user-allowlist.js'
 import { allowlistDecision, expandPathsWithParents } from '../lib/allowlist.js'
 import { createUnknownSessionTracker } from '../lib/unknown-session-tracker.js'
@@ -59,6 +59,8 @@ const PH_PARAMS = [
   'planGrantWrites', 'suggestedDirs', 'inferredDirs', 'scanPathsLoose', 'takeDecisionPaths',
   // v0.7.17：绑定记录缺 cwd/parentSessionId 时回退持久 registry
   'registry',
+  // v0.7.23：无路径执行类命令的"生效目录"解析（工作区放行的第二个判据）
+  'executeScopeOf',
 ]
 
 /**
@@ -145,6 +147,7 @@ function harness(host = {}) {
     host.scanPathsLoose || scanPathsLoose,
     takeDecisionPaths,
     host.registry || { get: () => undefined },
+    executeScopeOf,
   )
   // 真实决策入口：apply() 里注册的那个回调（含"未知 permId 忽略"分支）
   const onDecision = new Function(
@@ -3152,15 +3155,22 @@ describe('v0.7.16 高危归因字段：危险 ASK 带、非危险 ASK 不带（�
       '命中片段必须落在旧截断点**之后**——否则这条用例钉不住那个缺陷')
   })
 
-  it('非危险 ASK ⇒ 载荷**不带**这些字段（不新增语义，老消费方看到的形状不变）', async () => {
+  it('非危险 ASK ⇒ 不带 danger* 四件套；v0.7.28 起带 askReason + commandText（面板要显示原因与命令）', async () => {
     const h = harness({ bindings: bound() })
     h.permissionHandler(bashReq('tc-a3', 'ls -la /etc/hosts', ['/etc/hosts']))
     await flush()
     const [pending] = h.pendingEvents()
     assert.equal(h.pendingEvents().length, 1, '前置条件：这条确实进了交互询问')
-    for (const key of ['askReason', 'dangerRule', 'dangerSegment', 'dangerCommand', 'dangerCommandOmitted']) {
-      assert.equal(key in pending, false, `非危险 ASK 不得带归因字段 ${key}`)
+    // v0.7.28（用户裁定「面板显示命令原文 + 拦截原因」）：非危险 ASK 现在也带归因，
+    // 但它**只**是 askReason（枚举值，渲染成中文短标签）+ 命令正文；
+    // danger* 四件套仍只在危险门命中的 ASK 上出现（它们与 danger 弹框的专用渲染绑定）。
+    for (const key of ['dangerRule', 'dangerSegment', 'dangerCommand', 'dangerCommandOmitted']) {
+      assert.equal(key in pending, false, `非危险 ASK 不得带危险归因字段 ${key}`)
     }
+    assert.ok(typeof pending.askReason === 'string' && pending.askReason.length > 0,
+      'v0.7.28：非危险 ASK 必须带 askReason（否则面板说不出为什么被拦）')
+    assert.ok(!pending.askReason.startsWith('danger'), `非危险 ASK 的 askReason 不得是 danger（实际 ${pending.askReason}）`)
+    assert.equal(pending.commandText, 'ls -la /etc/hosts', 'v0.7.28：面板要拿到命令原文')
     // 既有字段一个都不能少（归因是加法，不是替换）
     for (const key of ['childId', 'permId', 'product', 'description', 'paths', 'suggestedDirs', 'inferredDirs', 'category', 'toolName', 'toolNameSource', 'rawToolName', 'cwd', 'parentSessionId', 'remoteSessionId', 'at']) {
       assert.ok(key in pending, `老载荷键 ${key} 不得消失`)

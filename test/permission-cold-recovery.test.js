@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url'
 import { createPendingRegistry, createSessionRules, permissionCategoryKey, resolveToolName } from '../lib/permission-state.js'
 import { dangerousExecuteMatch } from '../lib/dangerous-commands.js'
 import { evaluateRuleSources, inferredDirs, planGrantWrites, suggestedDirs, workspaceRuleOf } from '../lib/permission-rules.js'
-import { extractPaths, scanPathsLoose } from '../lib/bridges/acp.js'
+import { executeScopeOf, extractPaths, scanPathsLoose } from '../lib/bridges/acp.js'
 import { appendUserRule, readUserAllowlist } from '../lib/user-allowlist.js'
 import { createUnknownSessionTracker } from '../lib/unknown-session-tracker.js'
 import { registerProductSubmit } from '../lib/tools/product-submit.js'
@@ -59,6 +59,8 @@ const PH_PARAMS = [
   'isRoundRejected', 'addRoundRejected', 'appendUserRule', 'console',
   'planGrantWrites', 'suggestedDirs', 'inferredDirs', 'scanPathsLoose', 'takeDecisionPaths',
   'registry',
+  // v0.7.23：无路径执行类命令的"生效目录"解析（工作区放行的第二个判据）
+  'executeScopeOf',
 ]
 
 /**
@@ -123,6 +125,7 @@ function handlerHarness(host = {}) {
     scanPathsLoose,
     takeDecisionPaths,
     registryStub,
+    executeScopeOf,
   )
   return {
     permissionHandler,

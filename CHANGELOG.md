@@ -1,3 +1,309 @@
+## [0.7.28] — 2026-10-31
+
+**分段静态判定：工作区内的日常命令不再弹窗；面板显示命令原文 + 拦截原因。**
+
+### 一、分段判定（本仓 `lib/permission-rules.js`）
+
+现场（真机矩阵，标准 senior-dev / codebuddy `permission: interactive`，以"界面上实际
+弹不弹"为准）：下面这些**日常命令**在工作区内仍误弹 ——
+
+| 命令 | 0.7.27 | 0.7.28 |
+|---|---|---|
+| `ls` / `git status --short` / `cat package.json` | ALLOW | ALLOW |
+| `node -e "console.log('ok')"` | **ASK（误弹）** | ASK（**刻意保留**） |
+| `grep -rn "x" lib \| head -3` | **ASK（误弹）** | ALLOW |
+| `echo hi > a.txt && cat a.txt` | **ASK（误弹）** | ALLOW |
+| `mkdir -p subdir` / `touch a.txt` | ASK/ALLOW 不一 | ALLOW |
+| `ls test/*.test.js` / `cd test && ls` / `cat 一句话/x.txt` | ASK | ALLOW |
+
+根因两层：① 路径提取只认绝对路径 ⇒ 相对/无路径命令 `paths=[]` ⇒ 工作区档无判据；
+② 形状闸门（`unsafeShapeOf`）把 `multi-command` / `pipe-to-interpreter` 一刀切转人工。
+
+修法：新增纯函数 **`segmentScopeOf(commandText, cwd)`**（`lib/permission-rules.js` 导出）：
+
+1. 按 `&&` `||` `;` `|` 换行**切段**（`lib/command-segments.js`，保留分隔符；
+   引号内不切、换行一律切且重置引号，与 `dangerous-commands.js` 的 `splitSubCommands` 同口径）；
+2. 逐段把路径 token 用**该段的生效目录**（含前面的 `cd` 链，`foldCdTarget` 与
+   `executeScopeOf` 共用同一实现）做 `path.resolve` 归一化，再判是否落在工作区子树内
+   （`resolveRealPath`，软链按真身判，与路径档同源）；
+3. **所有段的全部路径 token 都在工作区内** ⇒ 工作区档放行（`via: 'segment'`）；
+   已提取路径仍要求**全覆盖**（双保险）。
+
+**仍必须转人工**（逐条有单测）：`$(…)` / 反引号 / `${VAR}` / `$VAR`、`~/…`、`../`、
+解析后越界、管道右侧解释器、危险命令（门在最前，不动）、**内联代码执行**
+（`node -e` / `python -c` / `perl -e` / `ruby -e` / `sh -c` —— 静态判不出落点，
+刻意保留，注释已写明理由）、通配符 token（唯一例外：非通配前缀目录在工作区内且不含 `..`，
+如 `<WS>/test/*.test.js`）。
+
+判定顺序**未动**：危险门 → 形状/分段闸门 → workspace 档 → 原四档；`coversCwd` 之外的
+规则（会话档 / 落盘档 / provider 白名单）一条都没放宽。
+
+### 二、面板显示命令 / 原因（配合主仓 1.12.25）
+
+`product-subagents/permission-pending` 载荷新增两个**纯加法**字段：
+
+- `commandText`：执行类帧的命令正文原文；
+- `askReason`：从"只有危险门带"扩成**所有 ASK 都带**，枚举 `danger` / `shape:<id>` /
+  `no-command-text` / `no-paths` / `paths-partial` / `no-workspace-cover`。
+
+`danger*` 四件套（dangerRule / dangerSegment / dangerCommand / dangerCommandOmitted）
+仍**只在危险门命中**时出现。老消费方按未知字段忽略，形状兼容；对应的旧用例
+（`permission-handler-wiring.test.js` 的"非危险 ASK 不带归因"）已按新契约更新。
+
+### 一·补（追加 B/C）：相对越界操作数**进 paths**，手动登记的目录能覆盖它
+
+现场：用户在面板里把 `../../package.json` 改成目录 `…/develop` 并「记住会话内允许」，
+之后同样的命令**照旧弹**。根因不在规则层，而在**提取层把越界操作数整条丢了**：
+
+| 位置 | 旧行为 |
+|---|---|
+| `lib/bridges/acp.js:318` | `if (!isWriteTarget && !existsSync(resolved)) continue` —— 落点不存在 ⇒ 丢 |
+| `lib/bridges/acp.js:324` | `classifyPathToken(...) !== 'path'` —— 只收 `path`（`../x` 其实是 `path`，真正丢它的是上一行） |
+
+修法（`lib/bridges/acp.js`）：
+
+- 新增 `isStructuralRelative(raw)`（含分隔符 / 就是 `.`/`..`）⇒ **豁免存在性校验**。
+  理由：`path.resolve` 对结构化相对路径是**确定性**的，不依赖运行时也不依赖磁盘；
+  进 `paths` 只影响"规则能否匹配到这条客体"，自动放行仍要过形状闸门。
+- 收窄边界（旧行为逐字保留）：**裸文件名**（`missing.txt`，无分隔符）仍要求存在
+  —— 那是散文误判高发形态；`$HOME/x` / `${VAR}/x` / `*.js` / `a[0]` 仍是 `uncertain`
+  并丢弃（v0.7.25 B1 的教训：resolve 成 `<cwd>/字面量` 会落进工作区子树 ⇒ fail-open）。
+
+同时放宽闸门口径（`lib/permission-rules.js`）：
+
+- `relative-traversal` **不再是文本级闸门**：`..` 的归一化是确定性的，改成在
+  `segmentTokenBlock` 里逐 token 归一化后判归属 —— 落在区内 ⇒ 不拦（该 token 已在
+  `paths` 里，由路径档/会话档正常判定）；落在区外 ⇒ `relative-traversal`。
+  仍转人工的只有"算不准"的：变量展开 / 通配符 / 归一化失败 / `cd` 链（`extractPaths`
+  的基准是启动 cwd，与段生效目录不同 ⇒ 覆盖判定自然不通过）。
+- `variable-expansion` 文本级闸门**原样保留**（`${HOME}/x` 之类字面量不是真身）。
+- 选项形态（`--file=../x`）取 `=` 之后的路径部分再归一化（否则整条会被当成
+  `<cwd>/--file=../x` 落在区内 ⇒ 越界被吞）。
+- 显式授予的会话/落盘规则**本来就先于**工作区档评估（`evaluateRuleSources` 的顺序），
+  形状闸门只收紧 `coversCwd` 的工作区默认规则 —— 本轮不动这个顺序，只补用例钉住。
+
+### 测试
+
+- `test/workspace-command-scope.test.js`：新增 S1（10 条必须 ALLOW）/ S2（11 条必须 ASK）/
+  S3（危险门归因最前）/ S4（`shape:inline-code` + commandText）+ `segmentScopeOf` 判定表
+  17 条（纯函数）。文件内 40 条全绿。
+- 全量 `node --test`：780 条全绿；`node scripts/lint.js`：64 文件通过。
+
+## [0.7.27] — 2026-10-31
+
+**形状闸门补 `<` / `>`：重定向操作数搭车放行（fail-open）。**
+
+v0.7.26 两条形状规则的前置字符类是 `(^|[\s=:'"(\[{])`，即 `../` / `$VAR` 前面
+**必须**是“分隔符”。但重定向操作数前面是 `<` / `>`，中间没有空白：
+
+| 命令 | 修前 | 修后 |
+|---|---|---|
+| `cat <WS>/x.txt<../../.ssh/id_rsa` | **ALLOW（workspace/paths）** | ASK |
+| `cat <WS>/x.txt>../../.ssh/id_rsa` | ASK（`>` 侧本就提取到越界路径，偶然安全） | ASK |
+
+改法：前置字符类扩为 `(^|[\s=:'"(\[{<>])`，与主仓 `dsh-agent-dispatch` 1.12.24
+的 `lib/host-approval.js` 同步（双向注释已加）。
+
+回归：`test/workspace-command-scope.test.js` 新增 R10d / R10e（`<` / `>` 必须弹）；
+红线 R11（工作区内普通命令、glob、中文目录仍自动放行）保持通过。
+
+## [0.7.26] — 2026-10-31
+
+**终审阻塞修复（B3）：ACP 面上的「形状闸门」缺失 ⇒ 只要提取到一条工作区内路径，
+越界操作数就能搭车放行。**
+
+v0.7.25 修的是"提取到**零条**路径"时的 `pathFree` 失效；本轮修的是"提取到**一条**
+工作区内路径"时的对称缺口：
+
+| 命令 | 修前 | 修后 |
+|---|---|---|
+| `cat <WS>/package.json ../../.ssh/id_rsa` | **ALLOW（workspace/paths）** | ASK |
+| `cat <WS>/x.txt ${HOME}/.ssh/id_rsa` | **ALLOW（workspace/paths）** | ASK |
+| `cat <WS>/x.txt $VAR`（`$FOO/x`、`${FOO}/x` 同） | **ALLOW（workspace/paths）** | ASK |
+
+根因：`PATH_TOKEN_RE` 只认绝对路径与"含分隔符的相对路径"，`../../.ssh/id_rsa` 与
+`${HOME}/.ssh/id_rsa` **从未**作为独立条目进入 `paths`；而 `coverage` 只看"已提取的
+路径是否都在工作区内" ⇒ 路径集只剩工作区内那一条 ⇒ 全站 covered ⇒ 自动放行。
+主仓 `dsh-agent-dispatch/lib/host-approval.js` 早有这两条形状判据，但 ACP 子代理走的是
+本仓的 `permissionHandler`，判据一条都没有 ⇒ 该修复在 ACP 面上等于没做。
+
+### 改动
+
+1. `lib/permission-rules.js`：新增 `UNSAFE_SHAPE_RULES` + `unsafeShapeOf(commandText)`，
+   两条判据**逐字复用**主仓 `host-approval.js:582` / `:589` 的正则（`relative-traversal`、
+   `variable-expansion`），注释里互相标注"改动需双方同步"。方向同主仓
+   `unsafeCommandShape`：**不是判危险，而是"不猜"**。
+2. `ruleCoversRequest`：闸门放在**两条放行判据之前**，且只对 `coversCwd: true` 的规则
+   生效 ⇒ 路径档（`paths.length > 0`）与 `cwd` 旁路（`execCwd`）**一起**被挡，
+   命中即 `hit: false` 落到人工审批。会话档/落盘档/provider 白名单逐字不变（用户显式
+   授权，不受本闸门约束）。
+3. `evaluateRuleSources`：把命中的规则 id 以 `shapeGate` 字段带回，供日志归因（纯加法）。
+4. `lib/index.js`：`executeScopeOf` 从"仅 `reqPaths` 为空时算"改为**只要不是危险命令
+   且有 `bindCwd` 就算**——它的 `command` 是闸门的唯一输入，此前这个分支拿不到正文 ⇒
+   闸门形同不存在。`execCwd` 的取值条件逐字不变（仍要求 `reqPaths.length === 0`）。
+5. `test/workspace-command-scope.test.js`：新增 R10a/R10b/R10c（越界与三种变量写法必须弹）
+   与 R11（工作区内普通命令仍自动放行，红线）。
+
+### 未改动（明示）
+
+- 未改 `isJunkPathToken` / `classifyPathToken` 三态口径，未动高危名单，未改主仓代码。
+- `PATH_TOKEN_RE` 仍只认绝对路径与含分隔符的相对路径：本轮靠形状闸门兜住，
+  不扩大 `paths` 口径（那会连带改变写入授权集）。
+
+## [0.7.25] — 2026-10-31
+
+**终审阻塞修复（B1/B2）：元字符路径被当垃圾丢弃 ⇒ `pathFree` 失效 ⇒ 工作区外读写静默放行。**
+
+v0.7.24 的 H2 收口用了**二态**判据（`junk` / 非 junk），而且把同一个判据接到了
+`commandMentionsPath`（`executeScopeOf` 的 `pathFree` 守卫）上。结果是**双重失效**：
+
+1. `scanExecuteCommandPaths` 把 `cat $HOME/.ssh/id_rsa`、`cat ~/.ssh/*`、`ls /etc/*.conf`
+   这类 token 判成"代码片段"丢掉 ⇒ `paths` 为空；
+2. `commandMentionsPath` 用**同一个**判据把**同一个** token 也丢掉 ⇒ `pathFree` 仍判 `true`
+   ⇒ `lib/index.js` 给出 `execCwd = 工作区` ⇒ `permission-rules.js` 的 `coversCwd` 旁路命中
+   ⇒ **自动放行**。
+
+v0.7.24 注释里那句"不存在的绝对路径本来就读不到也写不了"是**错的**：glob 由 shell 展开，
+`/etc/*.conf` 真实可读，`echo x > ~/.*rc` 真实可写。丢掉的不是"读不到的路径"，
+而是"字面量 ≠ 真身"的路径。
+
+### 改动
+
+1. `lib/bridges/acp.js`：新增导出 `classifyPathToken(raw, absHint)`，**三态**：
+   - `junk`（唯一允许丢弃）：单字符语法残片 `{ } ( ) [ ] | \ `` ` ``、`undefined`/`null`/`NaN`
+     路径段、`=` 残片、**正则字面量**（以 `/` 开头 + 含 `^`/`$` + 紧跟 `/^` 或含 `\`/`|`）；
+   - `uncertain`：含 shell 展开成分 `* ? [ ] { } $ ( ) ^ | \ `` ` `` ⇒ 字面量不是真身；
+     绝对形态**收进 paths**（真身归属交规则层按字面子树判），相对形态**丢弃**且**不得**
+     算作"命令没碰路径"；
+   - `path`：形态正常的路径。
+   `isJunkPathToken` 保留为兼容布尔面（`=== 'junk'`）。
+2. 三处接线按三态重写：
+   - 绝对分支：只丢 `junk`（`uncertain` 必须收下 —— 这是 B1 的修法）；
+   - 相对分支：只收 `path`（把 `$HOME/…` resolve 成 `<cwd>/$HOME/…` 会**制造**一条工作区内的
+     假路径，反而自动放行）；
+   - `commandMentionsPath`：只把 `junk` 当"不是路径"，`uncertain` **一律**返回 `true`
+     ⇒ `pathFree=false` ⇒ 转人工（**不再复用二态 junk 口径**）。
+3. 【B1 附加收口】`stripUrls` 拆成 `stripUrlSchemes` + 协议相对段：`commandMentionsPath`
+   改用只剥 scheme 的版本。原第 4 条（把 `(^|\s)//x` 整段抹掉）是给**提取**用的
+   （防 `//example.com` 变成 `/` 规则），但 `pathFree` 跟着抹就是在谎报"命令没碰路径"
+   —— `cat //etc/passwd`（POSIX 下就是 `/etc/passwd`）因此被判成 `pathFree=true` 而放行。
+   提取侧行为不变（`paths('curl //example.com/path')` 仍为空集，既有用例钉住）。
+4. 【B2】`lib/bridges/acp.js:2` 补 `isAbsolute` 导入 —— `commandMentionsPath` 里用的
+   `path.isAbsolute` 从未导入（只导入了 `resolve`），`ReferenceError` 被空 `catch` 吞掉
+   ⇒ `probe` 恒为 `null` ⇒ 相对 token 退化成 `existsSync(raw)`（基准是**宿主
+   `process.cwd()`**，不是命令生效目录）⇒ 结果随宿主启动目录漂移。同时把空 `catch`
+   换成一次性 `console.warn`（`warnProbeFailedOnce`）。
+
+### 修前/修后（真实链路 `extractPaths → dangerousExecuteMatch → executeScopeOf → evaluateRuleSources`）
+
+| 命令 | 修前 | 修后 |
+| --- | --- | --- |
+| `cat $HOME/.ssh/id_rsa` | ALLOW | ask |
+| `cat ${HOME}/.ssh/id_rsa` | ALLOW | ask |
+| `cat ~/.ssh/*` | ALLOW | ask |
+| `ls /etc/*.conf` | ALLOW | ask |
+| `ls ~/.aws/*` | ALLOW | ask |
+| `echo pwned > ~/.*rc` | ALLOW | ask |
+| `mkdir -p ~/evil[1]` | ALLOW | ask |
+| `cat <兄弟仓>/lib/*.js` | ALLOW | ask |
+| `cat <WS>/test/*.test.js` | ALLOW | **allow**（工作区内 glob 不得误杀） |
+| `ls -la <存在的绝对目录>` / `mkdir -p .probe/x` / `cat ./notes.txt` | ALLOW | ALLOW |
+
+### 用例
+
+- `test/extract-paths.test.js`：`classifyPathToken` **直接单测**（junk / uncertain / path 三组，
+  覆盖 `*`、`$VAR`、`${VAR}`、`?`、`[1]`、`../../`、正则字面量）+ 提取层方向性
+  （绝对 uncertain 收进 paths、相对 uncertain 不得造人造路径、`pathFree` 必须 false）
+  + **B2 回归**（相对 token 以命令生效目录为基准探测，不是 `process.cwd()`）。
+- `test/workspace-command-scope.test.js`：R8 扩成参数化（6 条 glob/`$VAR` 形态），
+  新增 R9（真实提取链：工作区外 4 条必弹、工作区内 glob 必放）。
+
+## [0.7.24] — 2026-10-31
+
+**现场一锤定音：命令正文里的「正则字面量」被当成了绝对路径。**
+
+授权面板的「请求实际触达目录（建议）」里出现过 `/(^|\/)undefined(\/|\$)/` —— 那是
+`node -e "…"` 里的正则源码，因为以 `/` 开头被 `scanExecuteCommandPaths` 的**绝对路径
+分支无条件收下**（该分支此前没有任何合法性校验；相对路径至少有 `existsSync` 守卫）。
+同类样本：`<cwd>/{`、`<cwd>/undefined`、`<cwd>/=`。一条假路径足以让整条请求
+`uncovered`（`coverage` 要求全覆盖）⇒ 工作区内的普通命令也必弹。
+
+### 改动
+
+1. `lib/bridges/acp.js`：新增导出 `isJunkPathToken(raw, absHint)`。**存在性优先**：
+   磁盘上真有的路径一律放行（`lib[old]/a.txt` 这类合法名字不被误杀）；只对**不存在**的
+   token 判形态 —— 正则/Shell 元字符 `( ) [ ] { } | \ * ? ^ $ \` `、字面量
+   `undefined` / `null` / `NaN` 段、`=` 残片。
+2. 三处调用点全部接入（缺一处就漏一个面）：
+   - `scanExecuteCommandPaths` 的绝对路径分支（`continue`，不进 paths）；
+   - 相对路径分支在 `resolve` 之后（写目标豁免存在性时同样要过形态判据：`echo x > {`）；
+   - `commandMentionsPath`（`executeScopeOf` 的 `pathFree` 守卫）——否则 `ls` 里夹一段
+     正则就会让 `pathFree=false`，工作区内命令又被顶成交互。
+
+### 回归红线（用例钉住）
+
+`ls -la <存在的绝对目录>`、`mkdir -p .probe/x`、`cat ./notes.txt` 仍然照旧提取；
+`node -e "/(^|\/)undefined(\/|\$)/…"`、`> {`、`> =`、`cat <ws>/undefined` 一律不提取。
+
+## [0.7.23] — 2026-10-31
+
+**工作区（及子目录）内、非高危的执行类命令不再弹授权球——包括命令正文里
+一个路径 token 都没有的 `ls` / `git status` / `npm test`。**
+
+现场（用户报告）：ACP 子代理（codebuddy / qoder）在工作区里跑普通命令仍然弹球。
+复现用例直接把 `extractPaths` + `evaluateRuleSources(workspaceRuleOf(cwd))` 与
+真实 `permissionHandler` 接起来跑，结论是**两类请求分叉**：
+
+| 命令 | `extractPaths` | 修前 |
+| --- | --- | --- |
+| `cat sub/a.txt` | `['<ws>/sub/a.txt']` | allow（正常） |
+| `ls` / `git status` / `npm test` | `[]` | **弹窗** |
+| `cd sub && ls` | `[]` | **弹窗** |
+
+根因：工作区默认规则的判据是"请求路径**全部**落在 cwd 子树内"，而 `coverage()`
+（`lib/permission-rules.js`）要求 `paths.length > 0`——**无路径即永不命中**
+（这本身是 v0.7.9 就有的安全属性："无从证明落在授权范围内"）。但 `ls` 这类命令
+操作的就是当前目录，命令正文里根本没有路径可提取，于是一条普通命令每次都转人工。
+`cd sub && ls` 还叠加了第二层：相对路径提取只按**启动目录**解析，`cd` 之后的目标
+既没进 paths、也没改解析基准。
+
+### 改动（行为放宽，边界明确）
+
+1. **`lib/bridges/acp.js`：新增 `executeScopeOf(toolCall, { cwd })`** —— 命令的
+   "生效目录"。按 `&&` / `||` / `;` / 换行切段，串行解析段首 `cd <target>`
+   （`builtin cd`、`cd --`、`~` 家目录展开都认），返回最后一段的目录；`cd -`、
+   目标缺失或相对路径判不出 ⇒ `cwd: null`。同时返回 **`pathFree`**：命令正文里
+   是否**没有任何**路径候选 token（`cd` 目标除外；伪文件系统与根路径按既有负向
+   过滤跳过，否则 `2>/dev/null` 会让每条命令都退化成弹窗）。
+2. **`lib/permission-rules.js`：`workspaceRuleOf` 带 `coversCwd: true`**，
+   `ruleCoversRequest` 增加一条旁路——`paths` 为空 + 规则带 `coversCwd` +
+   `req.execCwd` 落在规则 cwd **子树**内 ⇒ `{ hit: true, via: 'cwd' }`。
+   会话档、落盘档、provider 白名单**没有**这个标记，故"无路径 ⇒ 不命中"对
+   它们逐字不变（`coverage()` 的 `paths.length > 0` 前置一行未动，
+   `test/allowlist.test.js` / `test/user-allowlist.test.js` 的钉子照旧）。
+3. **`lib/index.js` `permissionHandler`**：`reqPaths` 为空且非 danger 时补算
+   `executeScopeOf`，仅当 `execute && pathFree && cwd` 才把 `execCwd` 喂给
+   `evaluateRuleSources`；放行日志新增
+   `命中工作区默认规则（工作区内执行，命令生效目录 …）`，便于现场归因。
+
+### 没放宽的部分（用例钉住）
+
+- 危险命令门仍**先于**一切规则：`rm -rf` / `npm publish` / `git push`（含
+  `sudo`/`bash -c` 包装、`wrapper-nesting` / `shell-nesting`）在工作区内照样弹。
+- 工作区**外**路径（`cat /tmp/outside/x`）照旧走人工审批。
+- `cd ..`（逃出工作区）不命中——生效目录不在 cwd 子树内。
+- **`pathFree` 守卫**：命令正文里出现路径 token（`ls ~/.ssh`、`cat ../x`）时，
+  即便调用方传来的 `paths` 是空数组（提取层断链、产品载荷畸形），也不凭
+  "无路径"放行——不允许把"提取为空"放大成"工作区内任意命令免弹"。
+- 非执行类、无路径的请求（`web_search` 之类）不受影响。
+
+### 测试
+
+`test/workspace-command-scope.test.js`（新增，11 条）：工作区内带路径 / `ls` /
+`git status` / codebuddy 裸帧 / `cd sub && ls` 必须 `allow` 且**零**
+`permission-pending`；`rm -rf` / `git push` / 工作区外路径 / `cd ..` / 非执行类 /
+`paths` 被清空的越权命令必须仍然弹。
+
 ## [0.7.22] — 2026-10-24
 
 **接 code-buddy（`codebuddy --acp`）进 ACP 通道：它的权限请求字段名和 qoder 完全不同，
